@@ -9,6 +9,8 @@ use axum::{serve, Router};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+mod prover;
+
 const FIELD_LEN: usize = 32;
 
 #[derive(Debug, Deserialize)]
@@ -53,9 +55,9 @@ impl AppError {
         }
     }
 
-    fn not_implemented(message: impl Into<String>) -> Self {
+    fn internal(message: impl Into<String>) -> Self {
         Self {
-            status: StatusCode::NOT_IMPLEMENTED,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
         }
     }
@@ -73,6 +75,28 @@ impl IntoResponse for AppError {
     }
 }
 
+impl ProveRequest {
+    fn try_into_fixed(self) -> Result<prover::ProveRequest, AppError> {
+        Ok(prover::ProveRequest {
+            task_pda: vec_to_field("task_pda", self.task_pda)?,
+            agent_authority: vec_to_field("agent_authority", self.agent_authority)?,
+            constraint_hash: vec_to_field("constraint_hash", self.constraint_hash)?,
+            output_commitment: vec_to_field("output_commitment", self.output_commitment)?,
+            binding: vec_to_field("binding", self.binding)?,
+            nullifier: vec_to_field("nullifier", self.nullifier)?,
+        })
+    }
+}
+
+fn vec_to_field(name: &str, bytes: Vec<u8>) -> Result<[u8; FIELD_LEN], AppError> {
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        AppError::bad_request(format!(
+            "{name} must be exactly {FIELD_LEN} bytes, got {}",
+            bytes.len()
+        ))
+    })
+}
+
 fn app() -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -87,30 +111,14 @@ async fn healthz() -> Json<HealthResponse> {
 }
 
 async fn prove(Json(request): Json<ProveRequest>) -> Result<Json<ProveResponse>, AppError> {
-    validate_request(&request)?;
-    Err(AppError::not_implemented(
-        "proof generation is not wired in yet",
-    ))
-}
-
-fn validate_request(request: &ProveRequest) -> Result<(), AppError> {
-    validate_len("task_pda", &request.task_pda)?;
-    validate_len("agent_authority", &request.agent_authority)?;
-    validate_len("constraint_hash", &request.constraint_hash)?;
-    validate_len("output_commitment", &request.output_commitment)?;
-    validate_len("binding", &request.binding)?;
-    validate_len("nullifier", &request.nullifier)?;
-    Ok(())
-}
-
-fn validate_len(name: &str, bytes: &[u8]) -> Result<(), AppError> {
-    if bytes.len() != FIELD_LEN {
-        return Err(AppError::bad_request(format!(
-            "{name} must be exactly {FIELD_LEN} bytes, got {}",
-            bytes.len()
-        )));
-    }
-    Ok(())
+    let fixed = request.try_into_fixed()?;
+    let response =
+        prover::generate_proof(&fixed).map_err(|err| AppError::internal(err.to_string()))?;
+    Ok(Json(ProveResponse {
+        seal_bytes: response.seal_bytes,
+        journal: response.journal,
+        image_id: response.image_id.to_vec(),
+    }))
 }
 
 fn bind_addr() -> Result<SocketAddr, String> {
@@ -135,6 +143,11 @@ async fn main() {
                 .unwrap_or_else(|_| "agenc_prover_server=info,tower_http=info".into()),
         )
         .init();
+
+    if matches!(env::args().nth(1).as_deref(), Some("image-id")) {
+        println!("{}", prover::render_image_id(prover::image_id()));
+        return;
+    }
 
     let addr = bind_addr().unwrap_or_else(|err| {
         eprintln!("{err}");
@@ -215,7 +228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prove_returns_not_implemented_for_valid_input() {
+    async fn prove_returns_server_error_without_production_feature() {
         let response = app()
             .oneshot(
                 Request::builder()
@@ -228,6 +241,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        #[cfg(not(feature = "production-prover"))]
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

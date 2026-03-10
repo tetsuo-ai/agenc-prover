@@ -39,33 +39,47 @@ Response JSON:
 
 ## Current Status
 
-This repository currently contains the audited-friendly service skeleton only:
+This repository now contains the real proving path:
 
-- request validation
+- fixed `/prove` HTTP contract for AgenC
+- embedded RISC Zero guest/method build
+- Groth16 proof generation
+- fail-closed guard if the compiled guest image ID drifts from AgenC's pinned trusted image
 - health check endpoint
-- fixed API contract
 - Docker packaging
-
-The actual RISC Zero proving implementation is not wired in yet.
 
 ## Local Run
 
 ```bash
-cargo run -p agenc-prover-server
+cargo run -p agenc-prover-server --features production-prover
 ```
 
 By default the server binds to `127.0.0.1:8787`.
+
+Print the compiled image ID:
+
+```bash
+cargo run -p agenc-prover-server --features production-prover -- image-id
+```
 
 ## Docker Run
 
 ```bash
 docker build -t agenc-prover .
-docker run --rm -p 8787:8787 agenc-prover
+docker run --rm \
+  -p 8787:8787 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  agenc-prover
 ```
+
+Notes:
+
+- the current RISC Zero Groth16 path needs Linux `x86_64`
+- the container needs the host Docker socket because local Groth16 proving uses Docker under the hood
+- this is meant to run as a local sidecar or an operator-managed prover service, not inside the main AgenC app process
 
 ## Planned Direction
 
 - local sidecar mode for Linux x86_64 operators
 - later swap `http://127.0.0.1:8787` to hosted endpoints like `https://prover.agenc.tech`
-- add auth, rate limiting, billing, and full RISC Zero proof generation without changing the AgenC client contract
-
+- add auth, rate limiting, and billing without changing the AgenC client contract
