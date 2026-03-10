@@ -1,5 +1,6 @@
 [workspace]
-members = ["server"]
+members = ["guest", "methods", "server"]
+default-members = ["server"]
 resolver = "2"
 
 [workspace.package]
@@ -7,3 +8,9 @@ edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/tetsuo-ai/agenc-prover"
 
+[profile.dev]
+opt-level = 3
+
+[profile.release]
+debug = 1
+lto = true
