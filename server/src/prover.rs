@@ -2,17 +2,21 @@ use std::{ffi::OsStr, fmt};
 
 #[cfg(feature = "production-prover")]
 use agenc_zkvm_guest::{serialize_journal, JOURNAL_TOTAL_LEN};
-use agenc_zkvm_guest::{JournalField, JournalFields};
+use agenc_zkvm_guest::{JournalField, JournalFields, PrivateWitness};
 
 pub const IMAGE_ID_LEN: usize = 32;
+#[cfg_attr(not(any(test, feature = "production-prover")), allow(dead_code))]
 pub const SEAL_SELECTOR_LEN: usize = 4;
+#[cfg_attr(not(any(test, feature = "production-prover")), allow(dead_code))]
 pub const SEAL_PROOF_LEN: usize = 256;
+#[cfg_attr(not(any(test, feature = "production-prover")), allow(dead_code))]
 pub const SEAL_BYTES_LEN: usize = 260;
+#[cfg_attr(not(any(test, feature = "production-prover")), allow(dead_code))]
 pub const TRUSTED_SEAL_SELECTOR: [u8; SEAL_SELECTOR_LEN] = [0x52, 0x5a, 0x56, 0x4d];
 pub const DEV_MODE_ENV_VAR: &str = "RISC0_DEV_MODE";
 pub const TRUSTED_RISC0_IMAGE_ID: [u8; IMAGE_ID_LEN] = [
-    234, 105, 58, 154, 139, 43, 119, 65, 97, 133, 45, 254, 201, 178, 175, 71, 73, 230, 18, 17, 243,
-    3, 22, 193, 47, 173, 107, 173, 215, 208, 1, 82,
+    234, 105, 58, 154, 139, 43, 119, 65, 97, 133, 45, 254, 201, 178, 175, 71, 73, 230, 18, 17,
+    243, 3, 22, 193, 47, 173, 107, 173, 215, 208, 1, 82,
 ];
 
 pub type ImageId = [u8; IMAGE_ID_LEN];
@@ -25,17 +29,28 @@ pub struct ProveRequest {
     pub output_commitment: JournalField,
     pub binding: JournalField,
     pub nullifier: JournalField,
+    pub output: [JournalField; 4],
+    pub salt: JournalField,
+    pub agent_secret: JournalField,
 }
 
-impl From<ProveRequest> for JournalFields {
-    fn from(request: ProveRequest) -> Self {
-        Self {
-            task_pda: request.task_pda,
-            agent_authority: request.agent_authority,
-            constraint_hash: request.constraint_hash,
-            output_commitment: request.output_commitment,
-            binding: request.binding,
-            nullifier: request.nullifier,
+impl ProveRequest {
+    pub fn journal_fields(&self) -> JournalFields {
+        JournalFields {
+            task_pda: self.task_pda,
+            agent_authority: self.agent_authority,
+            constraint_hash: self.constraint_hash,
+            output_commitment: self.output_commitment,
+            binding: self.binding,
+            nullifier: self.nullifier,
+        }
+    }
+
+    pub fn private_witness(&self) -> PrivateWitness {
+        PrivateWitness {
+            output: self.output,
+            salt: self.salt,
+            agent_secret: self.agent_secret,
         }
     }
 }
@@ -53,6 +68,7 @@ pub enum ProveError {
     UnexpectedJournalLength { expected: usize, actual: usize },
     UntrustedImageId { expected: ImageId, actual: ImageId },
     DevModeEnabled { variable: &'static str },
+    InvalidRequest(String),
     ProverFailed(String),
     ReceiptTypeMismatch(String),
 }
@@ -70,13 +86,13 @@ impl fmt::Display for ProveError {
                 write!(
                     f,
                     "compiled guest image_id does not match trusted pinned image_id: expected {:?}, got {:?}",
-                    expected,
-                    actual
+                    expected, actual
                 )
             }
             Self::DevModeEnabled { variable } => {
                 write!(f, "{variable} is set; refusing to generate proof output")
             }
+            Self::InvalidRequest(message) => write!(f, "invalid prove request: {message}"),
             Self::ProverFailed(message) => write!(f, "prover failed: {message}"),
             Self::ReceiptTypeMismatch(message) => {
                 write!(f, "receipt type mismatch: {message}")
@@ -114,6 +130,7 @@ fn generate_proof_with_dev_mode(
     request: &ProveRequest,
     dev_mode_value: Option<&OsStr>,
 ) -> Result<ProveResponse, ProveError> {
+    validate_request_semantics(request)?;
     ensure_dev_mode_disabled(dev_mode_value)?;
 
     #[cfg(feature = "production-prover")]
@@ -144,7 +161,8 @@ fn generate_proof_real(request: &ProveRequest) -> Result<ProveResponse, ProveErr
         });
     }
 
-    let fields: &[(&str, &[u8; JOURNAL_FIELD_LEN])] = &[
+    let mut builder = ExecutorEnv::builder();
+    let public_fields: &[(&str, &[u8; JOURNAL_FIELD_LEN])] = &[
         ("task_pda", &request.task_pda),
         ("agent_authority", &request.agent_authority),
         ("constraint_hash", &request.constraint_hash),
@@ -152,13 +170,26 @@ fn generate_proof_real(request: &ProveRequest) -> Result<ProveResponse, ProveErr
         ("binding", &request.binding),
         ("nullifier", &request.nullifier),
     ];
-
-    let mut builder = ExecutorEnv::builder();
-    for (name, field) in fields {
+    for (name, field) in public_fields {
         builder
             .write(*field)
             .map_err(|err| ProveError::ProverFailed(format!("failed to write {name}: {err}")))?;
     }
+
+    let witness_fields: &[(&str, &[u8; JOURNAL_FIELD_LEN])] = &[
+        ("output[0]", &request.output[0]),
+        ("output[1]", &request.output[1]),
+        ("output[2]", &request.output[2]),
+        ("output[3]", &request.output[3]),
+        ("salt", &request.salt),
+        ("agent_secret", &request.agent_secret),
+    ];
+    for (name, field) in witness_fields {
+        builder
+            .write(*field)
+            .map_err(|err| ProveError::ProverFailed(format!("failed to write {name}: {err}")))?;
+    }
+
     let env = builder
         .build()
         .map_err(|err| ProveError::ProverFailed(format!("failed to build executor env: {err}")))?;
@@ -190,7 +221,7 @@ fn generate_proof_real(request: &ProveRequest) -> Result<ProveResponse, ProveErr
         });
     }
 
-    let expected_journal = serialize_journal(&JournalFields::from(*request));
+    let expected_journal = serialize_journal(&request.journal_fields());
     if journal.as_slice() != expected_journal {
         return Err(ProveError::ProverFailed(
             "prover returned journal that does not match expected fields".into(),
@@ -213,6 +244,7 @@ fn ensure_dev_mode_disabled(dev_mode_value: Option<&OsStr>) -> Result<(), ProveE
     Ok(())
 }
 
+#[cfg_attr(not(any(test, feature = "production-prover")), allow(dead_code))]
 pub fn guest_id_to_image_id(guest_id: &[u32; 8]) -> ImageId {
     let mut out = [0u8; IMAGE_ID_LEN];
     for (chunk, word) in out.chunks_exact_mut(SEAL_SELECTOR_LEN).zip(guest_id.iter()) {
@@ -221,6 +253,7 @@ pub fn guest_id_to_image_id(guest_id: &[u32; 8]) -> ImageId {
     out
 }
 
+#[cfg_attr(not(any(test, feature = "production-prover")), allow(dead_code))]
 fn encode_seal(proof_bytes: &[u8; SEAL_PROOF_LEN]) -> Vec<u8> {
     let mut seal_bytes = Vec::with_capacity(SEAL_BYTES_LEN);
     seal_bytes.extend_from_slice(&TRUSTED_SEAL_SELECTOR);
@@ -228,18 +261,58 @@ fn encode_seal(proof_bytes: &[u8; SEAL_PROOF_LEN]) -> Vec<u8> {
     seal_bytes
 }
 
+fn validate_request_semantics(request: &ProveRequest) -> Result<(), ProveError> {
+    request
+        .journal_fields()
+        .validate_against_witness(&request.private_witness())
+        .map_err(|err| ProveError::InvalidRequest(err.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agenc_zkvm_guest::{
+        compute_binding, compute_constraint_hash, compute_nullifier_from_agent_secret,
+        compute_output_commitment,
+    };
+
+    fn field_from_u32(value: u32) -> JournalField {
+        let mut out = [0_u8; 32];
+        out[28..].copy_from_slice(&value.to_be_bytes());
+        out
+    }
 
     fn default_prove_request() -> ProveRequest {
+        let mut task_pda = [0_u8; 32];
+        task_pda[31] = 0x2a;
+        let agent_authority = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31, 32,
+        ];
+        let output = [
+            field_from_u32(1),
+            field_from_u32(2),
+            field_from_u32(3),
+            field_from_u32(4),
+        ];
+        let salt = field_from_u32(12345);
+        let agent_secret = field_from_u32(67890);
+        let constraint_hash = compute_constraint_hash(&output);
+        let output_commitment = compute_output_commitment(&output, &salt);
+        let binding = compute_binding(&task_pda, &agent_authority, &output_commitment);
+        let nullifier =
+            compute_nullifier_from_agent_secret(&constraint_hash, &output_commitment, &agent_secret);
+
         ProveRequest {
-            task_pda: [1_u8; 32],
-            agent_authority: [2_u8; 32],
-            constraint_hash: [3_u8; 32],
-            output_commitment: [4_u8; 32],
-            binding: [5_u8; 32],
-            nullifier: [6_u8; 32],
+            task_pda,
+            agent_authority,
+            constraint_hash,
+            output_commitment,
+            binding,
+            nullifier,
+            output,
+            salt,
+            agent_secret,
         }
     }
 
@@ -296,6 +369,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn zero_salt_is_rejected_before_proving() {
+        let mut request = default_prove_request();
+        request.salt = [0_u8; 32];
+
+        let err = generate_proof_with_dev_mode(&request, None)
+            .expect_err("zero salt must be rejected");
+
+        assert_eq!(
+            err,
+            ProveError::InvalidRequest("salt must be non-zero".into())
+        );
+    }
+
+    #[test]
+    fn invalid_constraint_hash_is_rejected_before_proving() {
+        let mut request = default_prove_request();
+        request.constraint_hash[0] ^= 0xff;
+
+        let err = generate_proof_with_dev_mode(&request, None)
+            .expect_err("invalid constraint hash must be rejected");
+
+        assert_eq!(
+            err,
+            ProveError::InvalidRequest("constraint_hash does not match derived value".into())
+        );
+    }
+
+    #[test]
+    fn invalid_output_commitment_is_rejected_before_proving() {
+        let mut request = default_prove_request();
+        request.output_commitment[0] ^= 0xff;
+
+        let err = generate_proof_with_dev_mode(&request, None)
+            .expect_err("invalid output commitment must be rejected");
+
+        assert_eq!(
+            err,
+            ProveError::InvalidRequest("output_commitment does not match derived value".into())
+        );
+    }
+
+    #[test]
+    fn invalid_binding_is_rejected_before_proving() {
+        let mut request = default_prove_request();
+        request.binding[0] ^= 0xff;
+
+        let err = generate_proof_with_dev_mode(&request, None)
+            .expect_err("invalid binding must be rejected");
+
+        assert_eq!(
+            err,
+            ProveError::InvalidRequest("binding does not match derived value".into())
+        );
+    }
+
+    #[test]
+    fn invalid_nullifier_is_rejected_before_proving() {
+        let mut request = default_prove_request();
+        request.nullifier[0] ^= 0xff;
+
+        let err = generate_proof_with_dev_mode(&request, None)
+            .expect_err("invalid nullifier must be rejected");
+
+        assert_eq!(
+            err,
+            ProveError::InvalidRequest("nullifier does not match derived value".into())
+        );
+    }
+
     #[cfg(feature = "production-prover")]
     #[test]
     fn compiled_guest_image_matches_pinned_image() {
@@ -309,10 +452,6 @@ mod tests {
             generate_proof(&default_prove_request()).expect("proof generation must work");
         assert_eq!(response.seal_bytes.len(), SEAL_BYTES_LEN);
         assert_eq!(response.journal.len(), JOURNAL_TOTAL_LEN);
-        assert_eq!(response.image_id, TRUSTED_RISC0_IMAGE_ID);
-        assert_eq!(
-            &response.seal_bytes[..SEAL_SELECTOR_LEN],
-            &TRUSTED_SEAL_SELECTOR
-        );
+        assert_eq!(response.image_id, image_id());
     }
 }

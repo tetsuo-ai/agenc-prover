@@ -12,6 +12,7 @@ use tracing::info;
 mod prover;
 
 const FIELD_LEN: usize = 32;
+const OUTPUT_COUNT: usize = 4;
 
 #[derive(Debug, Deserialize)]
 struct ProveRequest {
@@ -21,6 +22,9 @@ struct ProveRequest {
     output_commitment: Vec<u8>,
     binding: Vec<u8>,
     nullifier: Vec<u8>,
+    output: Vec<Vec<u8>>,
+    salt: Vec<u8>,
+    agent_secret: Vec<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,6 +81,8 @@ impl IntoResponse for AppError {
 
 impl ProveRequest {
     fn try_into_fixed(self) -> Result<prover::ProveRequest, AppError> {
+        let output = self.output.try_into_fixed_output()?;
+
         Ok(prover::ProveRequest {
             task_pda: vec_to_field("task_pda", self.task_pda)?,
             agent_authority: vec_to_field("agent_authority", self.agent_authority)?,
@@ -84,7 +90,32 @@ impl ProveRequest {
             output_commitment: vec_to_field("output_commitment", self.output_commitment)?,
             binding: vec_to_field("binding", self.binding)?,
             nullifier: vec_to_field("nullifier", self.nullifier)?,
+            output,
+            salt: vec_to_field("salt", self.salt)?,
+            agent_secret: vec_to_field("agent_secret", self.agent_secret)?,
         })
+    }
+}
+
+trait OutputFieldsExt {
+    fn try_into_fixed_output(self) -> Result<[[u8; FIELD_LEN]; OUTPUT_COUNT], AppError>;
+}
+
+impl OutputFieldsExt for Vec<Vec<u8>> {
+    fn try_into_fixed_output(self) -> Result<[[u8; FIELD_LEN]; OUTPUT_COUNT], AppError> {
+        let outputs: [Vec<u8>; OUTPUT_COUNT] = self.try_into().map_err(|values: Vec<Vec<u8>>| {
+            AppError::bad_request(format!(
+                "output must contain exactly {OUTPUT_COUNT} field elements, got {}",
+                values.len()
+            ))
+        })?;
+
+        Ok([
+            vec_to_field("output[0]", outputs[0].clone())?,
+            vec_to_field("output[1]", outputs[1].clone())?,
+            vec_to_field("output[2]", outputs[2].clone())?,
+            vec_to_field("output[3]", outputs[3].clone())?,
+        ])
     }
 }
 
@@ -112,8 +143,11 @@ async fn healthz() -> Json<HealthResponse> {
 
 async fn prove(Json(request): Json<ProveRequest>) -> Result<Json<ProveResponse>, AppError> {
     let fixed = request.try_into_fixed()?;
-    let response =
-        prover::generate_proof(&fixed).map_err(|err| AppError::internal(err.to_string()))?;
+    let response = prover::generate_proof(&fixed).map_err(|err| match err {
+        prover::ProveError::InvalidRequest(message) => AppError::bad_request(message),
+        other => AppError::internal(other.to_string()),
+    })?;
+
     Ok(Json(ProveResponse {
         seal_bytes: response.seal_bytes,
         journal: response.journal,
@@ -169,18 +203,62 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agenc_zkvm_guest::{
+        compute_binding, compute_constraint_hash, compute_nullifier_from_agent_secret,
+        compute_output_commitment,
+    };
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    fn field_from_u32(value: u32) -> Vec<u8> {
+        let mut out = vec![0_u8; FIELD_LEN];
+        out[28..].copy_from_slice(&value.to_be_bytes());
+        out
+    }
+
     fn valid_request_json() -> String {
+        let mut task_pda = vec![0_u8; FIELD_LEN];
+        task_pda[31] = 0x2a;
+        let agent_authority = (1u8..=32u8).collect::<Vec<_>>();
+        let output = vec![
+            field_from_u32(1),
+            field_from_u32(2),
+            field_from_u32(3),
+            field_from_u32(4),
+        ];
+        let output_fields = [
+            vec_to_field("output[0]", output[0].clone()).unwrap(),
+            vec_to_field("output[1]", output[1].clone()).unwrap(),
+            vec_to_field("output[2]", output[2].clone()).unwrap(),
+            vec_to_field("output[3]", output[3].clone()).unwrap(),
+        ];
+        let salt = field_from_u32(12345);
+        let agent_secret = field_from_u32(67890);
+        let constraint_hash = compute_constraint_hash(&output_fields);
+        let output_commitment =
+            compute_output_commitment(&output_fields, &vec_to_field("salt", salt.clone()).unwrap());
+        let binding = compute_binding(
+            &vec_to_field("task_pda", task_pda.clone()).unwrap(),
+            &vec_to_field("agent_authority", agent_authority.clone()).unwrap(),
+            &output_commitment,
+        );
+        let nullifier = compute_nullifier_from_agent_secret(
+            &constraint_hash,
+            &output_commitment,
+            &vec_to_field("agent_secret", agent_secret.clone()).unwrap(),
+        );
+
         serde_json::json!({
-            "task_pda": vec![1; FIELD_LEN],
-            "agent_authority": vec![2; FIELD_LEN],
-            "constraint_hash": vec![3; FIELD_LEN],
-            "output_commitment": vec![4; FIELD_LEN],
-            "binding": vec![5; FIELD_LEN],
-            "nullifier": vec![6; FIELD_LEN]
+            "task_pda": task_pda,
+            "agent_authority": agent_authority,
+            "constraint_hash": constraint_hash,
+            "output_commitment": output_commitment,
+            "binding": binding,
+            "nullifier": nullifier,
+            "output": output,
+            "salt": salt,
+            "agent_secret": agent_secret
         })
         .to_string()
     }
@@ -208,7 +286,10 @@ mod tests {
             "constraint_hash": vec![3; FIELD_LEN],
             "output_commitment": vec![4; FIELD_LEN],
             "binding": vec![5; FIELD_LEN],
-            "nullifier": vec![6; FIELD_LEN]
+            "nullifier": vec![6; FIELD_LEN],
+            "output": vec![vec![7; FIELD_LEN]; OUTPUT_COUNT],
+            "salt": vec![8; FIELD_LEN],
+            "agent_secret": vec![9; FIELD_LEN]
         })
         .to_string();
 
@@ -219,6 +300,57 @@ mod tests {
                     .uri("/prove")
                     .header("content-type", "application/json")
                     .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn prove_rejects_wrong_output_count() {
+        let payload = serde_json::json!({
+            "task_pda": vec![1; FIELD_LEN],
+            "agent_authority": vec![2; FIELD_LEN],
+            "constraint_hash": vec![3; FIELD_LEN],
+            "output_commitment": vec![4; FIELD_LEN],
+            "binding": vec![5; FIELD_LEN],
+            "nullifier": vec![6; FIELD_LEN],
+            "output": vec![vec![7; FIELD_LEN]; 3],
+            "salt": vec![8; FIELD_LEN],
+            "agent_secret": vec![9; FIELD_LEN]
+        })
+        .to_string();
+
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prove")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn prove_rejects_invalid_semantics_as_bad_request() {
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&valid_request_json()).expect("valid request json");
+        payload["binding"] = serde_json::json!(vec![0; FIELD_LEN]);
+
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prove")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
                     .unwrap(),
             )
             .await
