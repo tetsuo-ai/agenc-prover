@@ -1,8 +1,8 @@
 use std::env;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
-use axum::extract::Json;
-use axum::http::StatusCode;
+use axum::extract::{Json, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{serve, Router};
@@ -13,6 +13,26 @@ mod prover;
 
 const FIELD_LEN: usize = 32;
 const OUTPUT_COUNT: usize = 4;
+const PROVER_HOST_ENV: &str = "PROVER_HOST";
+const PROVER_PORT_ENV: &str = "PROVER_PORT";
+const PROVER_API_KEY_ENV: &str = "PROVER_API_KEY";
+const PROVER_LOCAL_DEV_MODE_ENV: &str = "PROVER_LOCAL_DEV_MODE";
+
+#[derive(Clone)]
+struct AppState {
+    prove_auth: ProveAuth,
+}
+
+#[derive(Clone)]
+enum ProveAuth {
+    Disabled,
+    ApiKey(String),
+}
+
+struct RuntimeConfig {
+    addr: SocketAddr,
+    prove_auth: ProveAuth,
+}
 
 #[derive(Debug, Deserialize)]
 struct ProveRequest {
@@ -62,6 +82,13 @@ impl AppError {
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
             message: message.into(),
         }
     }
@@ -128,10 +155,11 @@ fn vec_to_field(name: &str, bytes: Vec<u8>) -> Result<[u8; FIELD_LEN], AppError>
     })
 }
 
-fn app() -> Router {
+fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/prove", post(prove))
+        .with_state(state)
 }
 
 async fn healthz() -> Json<HealthResponse> {
@@ -141,7 +169,13 @@ async fn healthz() -> Json<HealthResponse> {
     })
 }
 
-async fn prove(Json(request): Json<ProveRequest>) -> Result<Json<ProveResponse>, AppError> {
+async fn prove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProveRequest>,
+) -> Result<Json<ProveResponse>, AppError> {
+    state.prove_auth.authorize(&headers)?;
+
     let fixed = request.try_into_fixed()?;
     let response = prover::generate_proof(&fixed).map_err(|err| match err {
         prover::ProveError::InvalidRequest(message) => AppError::bad_request(message),
@@ -156,17 +190,95 @@ async fn prove(Json(request): Json<ProveRequest>) -> Result<Json<ProveResponse>,
 }
 
 fn bind_addr() -> Result<SocketAddr, String> {
-    let host = env::var("PROVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port = env::var("PROVER_PORT").unwrap_or_else(|_| "8787".to_string());
+    let host = env::var(PROVER_HOST_ENV).unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = env::var(PROVER_PORT_ENV).unwrap_or_else(|_| "8787".to_string());
 
     let ip = host
         .parse::<IpAddr>()
-        .map_err(|err| format!("invalid PROVER_HOST {host}: {err}"))?;
+        .map_err(|err| format!("invalid {PROVER_HOST_ENV} {host}: {err}"))?;
     let port = port
         .parse::<u16>()
-        .map_err(|err| format!("invalid PROVER_PORT {port}: {err}"))?;
+        .map_err(|err| format!("invalid {PROVER_PORT_ENV} {port}: {err}"))?;
 
     Ok(SocketAddr::new(ip, port))
+}
+
+fn runtime_config() -> Result<RuntimeConfig, String> {
+    let addr = bind_addr()?;
+    let local_dev_mode = parse_env_bool(PROVER_LOCAL_DEV_MODE_ENV)?;
+    let api_key = env::var(PROVER_API_KEY_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let prove_auth = resolve_prove_auth(addr.ip(), local_dev_mode, api_key)?;
+
+    Ok(RuntimeConfig { addr, prove_auth })
+}
+
+fn parse_env_bool(name: &str) -> Result<bool, String> {
+    match env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            other => Err(format!("invalid {name} value {other:?}; use true/false")),
+        },
+        Err(env::VarError::NotPresent) => Ok(false),
+        Err(env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid UTF-8")),
+    }
+}
+
+fn resolve_prove_auth(
+    bind_ip: IpAddr,
+    local_dev_mode: bool,
+    api_key: Option<String>,
+) -> Result<ProveAuth, String> {
+    if local_dev_mode {
+        if !bind_ip.is_loopback() {
+            return Err(format!(
+                "{PROVER_LOCAL_DEV_MODE_ENV}=true is only allowed when {PROVER_HOST_ENV} is loopback"
+            ));
+        }
+
+        return Ok(ProveAuth::Disabled);
+    }
+
+    let api_key = api_key.ok_or_else(|| {
+        format!(
+            "{PROVER_API_KEY_ENV} is required unless {PROVER_LOCAL_DEV_MODE_ENV}=true on loopback"
+        )
+    })?;
+
+    Ok(ProveAuth::ApiKey(api_key))
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+
+    Some(token)
+}
+
+impl ProveAuth {
+    fn authorize(&self, headers: &HeaderMap) -> Result<(), AppError> {
+        match self {
+            ProveAuth::Disabled => Ok(()),
+            ProveAuth::ApiKey(expected) => match extract_bearer_token(headers) {
+                Some(candidate) if candidate == expected => Ok(()),
+                Some(_) => Err(AppError::unauthorized("invalid API key")),
+                None => Err(AppError::unauthorized(
+                    "missing bearer token for /prove",
+                )),
+            },
+        }
+    }
 }
 
 #[tokio::main]
@@ -183,19 +295,34 @@ async fn main() {
         return;
     }
 
-    let addr = bind_addr().unwrap_or_else(|err| {
+    let runtime = runtime_config().unwrap_or_else(|err| {
         eprintln!("{err}");
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 8787))
+        std::process::exit(1);
     });
+    let addr = runtime.addr;
+    let state = AppState {
+        prove_auth: runtime.prove_auth,
+    };
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .unwrap_or_else(|err| panic!("failed to bind {addr}: {err}"));
+        .unwrap_or_else(|err| {
+            eprintln!("failed to bind {addr}: {err}");
+            std::process::exit(1);
+        });
     info!(
         "agenc-prover-server listening on {}",
         listener.local_addr().unwrap()
     );
-    serve(listener, app())
+    match &state.prove_auth {
+        ProveAuth::Disabled => info!(
+            "{PROVER_LOCAL_DEV_MODE_ENV}=true; /prove is running without auth on loopback"
+        ),
+        ProveAuth::ApiKey(_) => info!(
+            "/prove requires Authorization: Bearer <token>; configure {PROVER_API_KEY_ENV} for clients"
+        ),
+    }
+    serve(listener, app(state))
         .await
         .unwrap_or_else(|err| panic!("server failed: {err}"));
 }
@@ -209,7 +336,20 @@ mod tests {
     };
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::net::Ipv4Addr;
     use tower::ServiceExt;
+
+    fn local_dev_app() -> Router {
+        app(AppState {
+            prove_auth: ProveAuth::Disabled,
+        })
+    }
+
+    fn protected_app() -> Router {
+        app(AppState {
+            prove_auth: ProveAuth::ApiKey("test-token".to_string()),
+        })
+    }
 
     fn field_from_u32(value: u32) -> Vec<u8> {
         let mut out = vec![0_u8; FIELD_LEN];
@@ -265,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_ok() {
-        let response = app()
+        let response = local_dev_app()
             .oneshot(
                 Request::builder()
                     .uri("/healthz")
@@ -293,7 +433,7 @@ mod tests {
         })
         .to_string();
 
-        let response = app()
+        let response = local_dev_app()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -323,7 +463,7 @@ mod tests {
         })
         .to_string();
 
-        let response = app()
+        let response = local_dev_app()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -344,7 +484,7 @@ mod tests {
             serde_json::from_str(&valid_request_json()).expect("valid request json");
         payload["binding"] = serde_json::json!(vec![0; FIELD_LEN]);
 
-        let response = app()
+        let response = local_dev_app()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -360,8 +500,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prove_returns_server_error_without_production_feature() {
-        let response = app()
+    async fn prove_rejects_missing_bearer_token_when_protected() {
+        let response = protected_app()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -373,7 +513,70 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn prove_rejects_invalid_bearer_token_when_protected() {
+        let response = protected_app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prove")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer wrong-token")
+                    .body(Body::from(valid_request_json()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn prove_accepts_valid_bearer_token_when_protected() {
+        let response = protected_app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prove")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::from(valid_request_json()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
         #[cfg(not(feature = "production-prover"))]
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn resolve_prove_auth_allows_explicit_loopback_local_dev_mode() {
+        let auth = resolve_prove_auth(IpAddr::V4(Ipv4Addr::LOCALHOST), true, None).unwrap();
+
+        assert!(matches!(auth, ProveAuth::Disabled));
+    }
+
+    #[test]
+    fn resolve_prove_auth_requires_api_key_outside_local_dev_mode() {
+        let error = match resolve_prove_auth(IpAddr::V4(Ipv4Addr::LOCALHOST), false, None) {
+            Err(error) => error,
+            Ok(_) => panic!("expected missing API key to fail"),
+        };
+
+        assert!(error.contains(PROVER_API_KEY_ENV));
+    }
+
+    #[test]
+    fn resolve_prove_auth_rejects_local_dev_mode_on_public_bind() {
+        let error = match resolve_prove_auth(IpAddr::V4(Ipv4Addr::UNSPECIFIED), true, None) {
+            Err(error) => error,
+            Ok(_) => panic!("expected non-loopback local dev mode to fail"),
+        };
+
+        assert!(error.contains(PROVER_LOCAL_DEV_MODE_ENV));
     }
 }
