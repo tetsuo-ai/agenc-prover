@@ -120,6 +120,15 @@ Notes:
 - the container needs the host Docker socket because local Groth16 proving uses Docker under the hood
 - this is meant to run as a local sidecar or an operator-managed prover service, not inside the main AgenC app process
 - because the Docker image binds `0.0.0.0`, it will refuse to start without `PROVER_API_KEY`
+- the Docker build pins the prover toolchain instead of bootstrapping it from a floating installer script
+- pinned Docker toolchain versions:
+  - `rzup 0.5.1`
+  - RISC Zero Rust toolchain `1.91.1`
+  - RISC Zero C++ toolchain `2024.01.05`
+  - `cargo-risczero 3.0.5`
+  - `r0vm 3.0.5`
+  - `risc0-groth16 0.1.0`
+- those pins match the current `risc0-zkvm 3.0.5` / `risc0-build 3.0.5` generation used by this repo
 
 ## Planned Direction
 
