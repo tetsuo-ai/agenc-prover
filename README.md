@@ -52,6 +52,14 @@ Authentication:
 - local sidecar mode is only allowed when the server binds to loopback
 - `/healthz` stays unauthenticated
 
+Execution controls:
+
+- `PROVER_MAX_IN_FLIGHT` limits how many proof requests can run at once
+- `PROVER_REQUEST_TIMEOUT_SECS` bounds how long the HTTP request waits for a proof result
+- the server does not queue extra work; once saturated, `/prove` fails fast with `503`
+- timed out requests return `504`
+- both `503` and `504` include `Retry-After`
+
 Response JSON:
 
 ```json
@@ -81,6 +89,8 @@ Protected mode is now the default:
 
 ```bash
 PROVER_API_KEY=change-me \
+PROVER_MAX_IN_FLIGHT=1 \
+PROVER_REQUEST_TIMEOUT_SECS=900 \
 cargo run -p agenc-prover-server --features production-prover
 ```
 
@@ -129,6 +139,8 @@ Notes:
   - `r0vm 3.0.5`
   - `risc0-groth16 0.1.0`
 - those pins match the current `risc0-zkvm 3.0.5` / `risc0-build 3.0.5` generation used by this repo
+- default execution policy is one in-flight proof and a 15 minute request timeout
+- timed out HTTP requests do not cancel the in-progress proof; the work continues until the prover finishes and the slot frees
 
 ## Planned Direction
 

@@ -1,13 +1,16 @@
 use std::env;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Json, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{serve, Router};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::{info, warn};
 
 mod prover;
 
@@ -17,10 +20,18 @@ const PROVER_HOST_ENV: &str = "PROVER_HOST";
 const PROVER_PORT_ENV: &str = "PROVER_PORT";
 const PROVER_API_KEY_ENV: &str = "PROVER_API_KEY";
 const PROVER_LOCAL_DEV_MODE_ENV: &str = "PROVER_LOCAL_DEV_MODE";
+const PROVER_MAX_IN_FLIGHT_ENV: &str = "PROVER_MAX_IN_FLIGHT";
+const PROVER_REQUEST_TIMEOUT_SECS_ENV: &str = "PROVER_REQUEST_TIMEOUT_SECS";
+const DEFAULT_PROVER_MAX_IN_FLIGHT: usize = 1;
+const DEFAULT_PROVER_REQUEST_TIMEOUT_SECS: u64 = 900;
+
+type ProveFn =
+    dyn Fn(prover::ProveRequest) -> Result<prover::ProveResponse, prover::ProveError> + Send + Sync;
 
 #[derive(Clone)]
 struct AppState {
     prove_auth: ProveAuth,
+    prove_runtime: ProveRuntime,
 }
 
 #[derive(Clone)]
@@ -29,9 +40,25 @@ enum ProveAuth {
     ApiKey(String),
 }
 
+#[derive(Clone)]
+struct ProveRuntime {
+    prove_fn: Arc<ProveFn>,
+    in_flight: Arc<Semaphore>,
+    max_in_flight: usize,
+    request_timeout: Duration,
+    retry_after_seconds: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ExecutionPolicy {
+    max_in_flight: usize,
+    request_timeout: Duration,
+}
+
 struct RuntimeConfig {
     addr: SocketAddr,
     prove_auth: ProveAuth,
+    execution_policy: ExecutionPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,46 +90,86 @@ struct HealthResponse {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+    code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_seconds: Option<u64>,
 }
 
 #[derive(Debug)]
 struct AppError {
     status: StatusCode,
+    code: &'static str,
     message: String,
+    retry_after_seconds: Option<u64>,
 }
 
 impl AppError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            code: "bad_request",
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
     fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
             message: message.into(),
+            retry_after_seconds: None,
+        }
+    }
+
+    fn overloaded(message: impl Into<String>, retry_after_seconds: u64) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "prove_overloaded",
+            message: message.into(),
+            retry_after_seconds: Some(retry_after_seconds),
+        }
+    }
+
+    fn timeout(message: impl Into<String>, retry_after_seconds: u64) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code: "prove_timeout",
+            message: message.into(),
+            retry_after_seconds: Some(retry_after_seconds),
         }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             Json(ErrorResponse {
                 error: self.message,
+                code: self.code,
+                retry_after_seconds: self.retry_after_seconds,
             }),
         )
-            .into_response()
+            .into_response();
+
+        if let Some(retry_after_seconds) = self.retry_after_seconds {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&retry_after_seconds.to_string()).unwrap(),
+            );
+        }
+
+        response
     }
 }
 
@@ -177,10 +244,36 @@ async fn prove(
     state.prove_auth.authorize(&headers)?;
 
     let fixed = request.try_into_fixed()?;
-    let response = prover::generate_proof(&fixed).map_err(|err| match err {
-        prover::ProveError::InvalidRequest(message) => AppError::bad_request(message),
-        other => AppError::internal(other.to_string()),
-    })?;
+    let permit = state.prove_runtime.try_acquire()?;
+    let prove_fn = state.prove_runtime.prove_fn.clone();
+    let request_timeout = state.prove_runtime.request_timeout;
+    let retry_after_seconds = state.prove_runtime.retry_after_seconds;
+    let handle = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        prove_fn(fixed)
+    });
+
+    let response = match tokio::time::timeout(request_timeout, handle).await {
+        Ok(joined) => joined
+            .map_err(|err| AppError::internal(format!("prover task join failed: {err}")))?
+            .map_err(|err| match err {
+                prover::ProveError::InvalidRequest(message) => AppError::bad_request(message),
+                other => AppError::internal(other.to_string()),
+            })?,
+        Err(_) => {
+            warn!(
+                request_timeout_secs = request_timeout.as_secs(),
+                "proof request timed out while proving continued in background"
+            );
+            return Err(AppError::timeout(
+                format!(
+                    "proof request exceeded {} seconds; retry after the current in-flight work settles",
+                    request_timeout.as_secs()
+                ),
+                retry_after_seconds,
+            ));
+        }
+    };
 
     Ok(Json(ProveResponse {
         seal_bytes: response.seal_bytes,
@@ -211,8 +304,13 @@ fn runtime_config() -> Result<RuntimeConfig, String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let prove_auth = resolve_prove_auth(addr.ip(), local_dev_mode, api_key)?;
+    let execution_policy = execution_policy()?;
 
-    Ok(RuntimeConfig { addr, prove_auth })
+    Ok(RuntimeConfig {
+        addr,
+        prove_auth,
+        execution_policy,
+    })
 }
 
 fn parse_env_bool(name: &str) -> Result<bool, String> {
@@ -251,6 +349,64 @@ fn resolve_prove_auth(
     Ok(ProveAuth::ApiKey(api_key))
 }
 
+fn execution_policy() -> Result<ExecutionPolicy, String> {
+    let max_in_flight =
+        parse_nonzero_usize_env(PROVER_MAX_IN_FLIGHT_ENV, DEFAULT_PROVER_MAX_IN_FLIGHT)?;
+    let request_timeout_secs = parse_nonzero_u64_env(
+        PROVER_REQUEST_TIMEOUT_SECS_ENV,
+        DEFAULT_PROVER_REQUEST_TIMEOUT_SECS,
+    )?;
+
+    Ok(resolve_execution_policy(max_in_flight, request_timeout_secs))
+}
+
+fn parse_nonzero_usize_env(name: &str, default: usize) -> Result<usize, String> {
+    match env::var(name) {
+        Ok(value) => {
+            let parsed = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|err| format!("invalid {name} value {value:?}: {err}"))?;
+            if parsed == 0 {
+                return Err(format!("{name} must be greater than zero"));
+            }
+            Ok(parsed)
+        }
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid UTF-8")),
+    }
+}
+
+fn parse_nonzero_u64_env(name: &str, default: u64) -> Result<u64, String> {
+    match env::var(name) {
+        Ok(value) => {
+            let parsed = value
+                .trim()
+                .parse::<u64>()
+                .map_err(|err| format!("invalid {name} value {value:?}: {err}"))?;
+            if parsed == 0 {
+                return Err(format!("{name} must be greater than zero"));
+            }
+            Ok(parsed)
+        }
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid UTF-8")),
+    }
+}
+
+fn resolve_execution_policy(max_in_flight: usize, request_timeout_secs: u64) -> ExecutionPolicy {
+    ExecutionPolicy {
+        max_in_flight,
+        request_timeout: Duration::from_secs(request_timeout_secs),
+    }
+}
+
+impl ExecutionPolicy {
+    fn retry_after_seconds(&self) -> u64 {
+        self.request_timeout.as_secs().max(1)
+    }
+}
+
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
@@ -281,6 +437,33 @@ impl ProveAuth {
     }
 }
 
+impl ProveRuntime {
+    fn new(execution_policy: ExecutionPolicy) -> Self {
+        Self {
+            prove_fn: Arc::new(|request| prover::generate_proof(&request)),
+            in_flight: Arc::new(Semaphore::new(execution_policy.max_in_flight)),
+            max_in_flight: execution_policy.max_in_flight,
+            request_timeout: execution_policy.request_timeout,
+            retry_after_seconds: execution_policy.retry_after_seconds(),
+        }
+    }
+
+    fn try_acquire(&self) -> Result<OwnedSemaphorePermit, AppError> {
+        self.in_flight
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                AppError::overloaded(
+                    format!(
+                        "prover is saturated: max {} in-flight proof request(s); queue policy is fail-fast",
+                        self.max_in_flight
+                    ),
+                    self.retry_after_seconds,
+                )
+            })
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -302,6 +485,7 @@ async fn main() {
     let addr = runtime.addr;
     let state = AppState {
         prove_auth: runtime.prove_auth,
+        prove_runtime: ProveRuntime::new(runtime.execution_policy),
     };
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -322,6 +506,12 @@ async fn main() {
             "/prove requires Authorization: Bearer <token>; configure {PROVER_API_KEY_ENV} for clients"
         ),
     }
+    info!(
+        max_in_flight = runtime.execution_policy.max_in_flight,
+        request_timeout_secs = runtime.execution_policy.request_timeout.as_secs(),
+        queue_policy = "fail-fast",
+        "active /prove execution limits"
+    );
     serve(listener, app(state))
         .await
         .unwrap_or_else(|err| panic!("server failed: {err}"));
@@ -337,17 +527,20 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     fn local_dev_app() -> Router {
         app(AppState {
             prove_auth: ProveAuth::Disabled,
+            prove_runtime: ProveRuntime::new(resolve_execution_policy(1, 900)),
         })
     }
 
     fn protected_app() -> Router {
         app(AppState {
             prove_auth: ProveAuth::ApiKey("test-token".to_string()),
+            prove_runtime: ProveRuntime::new(resolve_execution_policy(1, 900)),
         })
     }
 
@@ -553,6 +746,67 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    #[tokio::test]
+    async fn prove_fails_fast_when_saturated() {
+        let app = app(AppState {
+            prove_auth: ProveAuth::Disabled,
+            prove_runtime: ProveRuntime {
+                prove_fn: Arc::new(|_| unreachable!("saturated requests must not enter prover")),
+                in_flight: Arc::new(Semaphore::new(0)),
+                max_in_flight: 1,
+                request_timeout: Duration::from_secs(5),
+                retry_after_seconds: 5,
+            },
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prove")
+                    .header("content-type", "application/json")
+                    .body(Body::from(valid_request_json()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "5");
+    }
+
+    #[tokio::test]
+    async fn prove_returns_gateway_timeout_when_request_expires() {
+        let app = app(AppState {
+            prove_auth: ProveAuth::Disabled,
+            prove_runtime: ProveRuntime {
+                prove_fn: Arc::new(|_| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    Err(prover::ProveError::ProverFailed("slow proof".into()))
+                }),
+                in_flight: Arc::new(Semaphore::new(1)),
+                max_in_flight: 1,
+                request_timeout: Duration::from_millis(10),
+                retry_after_seconds: 1,
+            },
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prove")
+                    .header("content-type", "application/json")
+                    .body(Body::from(valid_request_json()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    }
+
     #[test]
     fn resolve_prove_auth_allows_explicit_loopback_local_dev_mode() {
         let auth = resolve_prove_auth(IpAddr::V4(Ipv4Addr::LOCALHOST), true, None).unwrap();
@@ -578,5 +832,14 @@ mod tests {
         };
 
         assert!(error.contains(PROVER_LOCAL_DEV_MODE_ENV));
+    }
+
+    #[test]
+    fn resolve_execution_policy_uses_expected_values() {
+        let policy = resolve_execution_policy(2, 600);
+
+        assert_eq!(policy.max_in_flight, 2);
+        assert_eq!(policy.request_timeout, Duration::from_secs(600));
+        assert_eq!(policy.retry_after_seconds(), 600);
     }
 }
