@@ -56,9 +56,12 @@ Execution controls:
 
 - `PROVER_MAX_IN_FLIGHT` limits how many proof requests can run at once
 - `PROVER_REQUEST_TIMEOUT_SECS` bounds how long the HTTP request waits for a proof result
+- `PROVER_RATE_LIMIT_MAX_REQUESTS` caps how many `/prove` calls are accepted per window
+- `PROVER_RATE_LIMIT_WINDOW_SECS` defines that fixed rate-limit window
+- once the rate limit is exceeded, `/prove` returns `429`
 - the server does not queue extra work; once saturated, `/prove` fails fast with `503`
 - timed out requests return `504`
-- both `503` and `504` include `Retry-After`
+- `429`, `503`, and `504` include `Retry-After`
 
 Response JSON:
 
@@ -80,6 +83,7 @@ This repository now contains the real proving path:
 - witness-based validation of the public journal fields before proving
 - fail-closed guard if the compiled guest image ID drifts from AgenC's pinned trusted image
 - explicit auth on `/prove`, with startup failure if the service is exposed without credentials
+- in-memory fixed-window rate limiting on `/prove`
 - health check endpoint
 - Docker packaging
 
@@ -91,6 +95,8 @@ Protected mode is now the default:
 PROVER_API_KEY=change-me \
 PROVER_MAX_IN_FLIGHT=1 \
 PROVER_REQUEST_TIMEOUT_SECS=900 \
+PROVER_RATE_LIMIT_MAX_REQUESTS=10 \
+PROVER_RATE_LIMIT_WINDOW_SECS=60 \
 cargo run -p agenc-prover-server --features production-prover
 ```
 
@@ -139,11 +145,11 @@ Notes:
   - `r0vm 3.0.5`
   - `risc0-groth16 0.1.0`
 - those pins match the current `risc0-zkvm 3.0.5` / `risc0-build 3.0.5` generation used by this repo
-- default execution policy is one in-flight proof and a 15 minute request timeout
+- default execution policy is one in-flight proof, a 15 minute request timeout, and 10 requests per 60 second window
 - timed out HTTP requests do not cancel the in-progress proof; the work continues until the prover finishes and the slot frees
 
 ## Planned Direction
 
 - local sidecar mode for Linux x86_64 operators
 - later swap `http://127.0.0.1:8787` to hosted endpoints like `https://prover.agenc.tech`
-- add rate limiting and billing without changing the response contract
+- add distributed quotas and billing without changing the response contract

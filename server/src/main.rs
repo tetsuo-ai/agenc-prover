@@ -1,7 +1,7 @@
 use std::env;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Json, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -22,8 +22,12 @@ const PROVER_API_KEY_ENV: &str = "PROVER_API_KEY";
 const PROVER_LOCAL_DEV_MODE_ENV: &str = "PROVER_LOCAL_DEV_MODE";
 const PROVER_MAX_IN_FLIGHT_ENV: &str = "PROVER_MAX_IN_FLIGHT";
 const PROVER_REQUEST_TIMEOUT_SECS_ENV: &str = "PROVER_REQUEST_TIMEOUT_SECS";
+const PROVER_RATE_LIMIT_MAX_REQUESTS_ENV: &str = "PROVER_RATE_LIMIT_MAX_REQUESTS";
+const PROVER_RATE_LIMIT_WINDOW_SECS_ENV: &str = "PROVER_RATE_LIMIT_WINDOW_SECS";
 const DEFAULT_PROVER_MAX_IN_FLIGHT: usize = 1;
 const DEFAULT_PROVER_REQUEST_TIMEOUT_SECS: u64 = 900;
+const DEFAULT_PROVER_RATE_LIMIT_MAX_REQUESTS: usize = 10;
+const DEFAULT_PROVER_RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 type ProveFn =
     dyn Fn(prover::ProveRequest) -> Result<prover::ProveResponse, prover::ProveError> + Send + Sync;
@@ -47,12 +51,37 @@ struct ProveRuntime {
     max_in_flight: usize,
     request_timeout: Duration,
     retry_after_seconds: u64,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 #[derive(Clone, Copy)]
 struct ExecutionPolicy {
     max_in_flight: usize,
     request_timeout: Duration,
+    rate_limit: RateLimitPolicy,
+}
+
+#[derive(Clone, Copy)]
+struct RateLimitPolicy {
+    max_requests: usize,
+    window: Duration,
+}
+
+#[derive(Clone, Copy)]
+enum RateLimitBucket {
+    LocalDev,
+    Protected,
+}
+
+struct RateLimiter {
+    policy: RateLimitPolicy,
+    local_dev: Mutex<FixedWindowState>,
+    protected: Mutex<FixedWindowState>,
+}
+
+struct FixedWindowState {
+    started_at: Instant,
+    request_count: usize,
 }
 
 struct RuntimeConfig {
@@ -140,6 +169,15 @@ impl AppError {
         }
     }
 
+    fn too_many_requests(message: impl Into<String>, retry_after_seconds: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "prove_rate_limited",
+            message: message.into(),
+            retry_after_seconds: Some(retry_after_seconds),
+        }
+    }
+
     fn timeout(message: impl Into<String>, retry_after_seconds: u64) -> Self {
         Self {
             status: StatusCode::GATEWAY_TIMEOUT,
@@ -197,12 +235,13 @@ trait OutputFieldsExt {
 
 impl OutputFieldsExt for Vec<Vec<u8>> {
     fn try_into_fixed_output(self) -> Result<[[u8; FIELD_LEN]; OUTPUT_COUNT], AppError> {
-        let outputs: [Vec<u8>; OUTPUT_COUNT] = self.try_into().map_err(|values: Vec<Vec<u8>>| {
-            AppError::bad_request(format!(
-                "output must contain exactly {OUTPUT_COUNT} field elements, got {}",
-                values.len()
-            ))
-        })?;
+        let outputs: [Vec<u8>; OUTPUT_COUNT] =
+            self.try_into().map_err(|values: Vec<Vec<u8>>| {
+                AppError::bad_request(format!(
+                    "output must contain exactly {OUTPUT_COUNT} field elements, got {}",
+                    values.len()
+                ))
+            })?;
 
         Ok([
             vec_to_field("output[0]", outputs[0].clone())?,
@@ -241,7 +280,8 @@ async fn prove(
     headers: HeaderMap,
     Json(request): Json<ProveRequest>,
 ) -> Result<Json<ProveResponse>, AppError> {
-    state.prove_auth.authorize(&headers)?;
+    let rate_limit_bucket = state.prove_auth.authorize(&headers)?;
+    state.prove_runtime.check_rate_limit(rate_limit_bucket)?;
 
     let fixed = request.try_into_fixed()?;
     let permit = state.prove_runtime.try_acquire()?;
@@ -356,8 +396,21 @@ fn execution_policy() -> Result<ExecutionPolicy, String> {
         PROVER_REQUEST_TIMEOUT_SECS_ENV,
         DEFAULT_PROVER_REQUEST_TIMEOUT_SECS,
     )?;
+    let rate_limit_max_requests = parse_nonzero_usize_env(
+        PROVER_RATE_LIMIT_MAX_REQUESTS_ENV,
+        DEFAULT_PROVER_RATE_LIMIT_MAX_REQUESTS,
+    )?;
+    let rate_limit_window_secs = parse_nonzero_u64_env(
+        PROVER_RATE_LIMIT_WINDOW_SECS_ENV,
+        DEFAULT_PROVER_RATE_LIMIT_WINDOW_SECS,
+    )?;
 
-    Ok(resolve_execution_policy(max_in_flight, request_timeout_secs))
+    Ok(resolve_execution_policy(
+        max_in_flight,
+        request_timeout_secs,
+        rate_limit_max_requests,
+        rate_limit_window_secs,
+    ))
 }
 
 fn parse_nonzero_usize_env(name: &str, default: usize) -> Result<usize, String> {
@@ -394,10 +447,19 @@ fn parse_nonzero_u64_env(name: &str, default: u64) -> Result<u64, String> {
     }
 }
 
-fn resolve_execution_policy(max_in_flight: usize, request_timeout_secs: u64) -> ExecutionPolicy {
+fn resolve_execution_policy(
+    max_in_flight: usize,
+    request_timeout_secs: u64,
+    rate_limit_max_requests: usize,
+    rate_limit_window_secs: u64,
+) -> ExecutionPolicy {
     ExecutionPolicy {
         max_in_flight,
         request_timeout: Duration::from_secs(request_timeout_secs),
+        rate_limit: RateLimitPolicy {
+            max_requests: rate_limit_max_requests,
+            window: Duration::from_secs(rate_limit_window_secs),
+        },
     }
 }
 
@@ -423,15 +485,13 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 impl ProveAuth {
-    fn authorize(&self, headers: &HeaderMap) -> Result<(), AppError> {
+    fn authorize(&self, headers: &HeaderMap) -> Result<RateLimitBucket, AppError> {
         match self {
-            ProveAuth::Disabled => Ok(()),
+            ProveAuth::Disabled => Ok(RateLimitBucket::LocalDev),
             ProveAuth::ApiKey(expected) => match extract_bearer_token(headers) {
-                Some(candidate) if candidate == expected => Ok(()),
+                Some(candidate) if candidate == expected => Ok(RateLimitBucket::Protected),
                 Some(_) => Err(AppError::unauthorized("invalid API key")),
-                None => Err(AppError::unauthorized(
-                    "missing bearer token for /prove",
-                )),
+                None => Err(AppError::unauthorized("missing bearer token for /prove")),
             },
         }
     }
@@ -445,7 +505,12 @@ impl ProveRuntime {
             max_in_flight: execution_policy.max_in_flight,
             request_timeout: execution_policy.request_timeout,
             retry_after_seconds: execution_policy.retry_after_seconds(),
+            rate_limiter: Arc::new(RateLimiter::new(execution_policy.rate_limit)),
         }
+    }
+
+    fn check_rate_limit(&self, bucket: RateLimitBucket) -> Result<(), AppError> {
+        self.rate_limiter.check(bucket)
     }
 
     fn try_acquire(&self) -> Result<OwnedSemaphorePermit, AppError> {
@@ -461,6 +526,61 @@ impl ProveRuntime {
                     self.retry_after_seconds,
                 )
             })
+    }
+}
+
+impl RateLimitPolicy {
+    fn retry_after_seconds(&self, elapsed: Duration) -> u64 {
+        self.window.saturating_sub(elapsed).as_secs().max(1)
+    }
+}
+
+impl RateLimiter {
+    fn new(policy: RateLimitPolicy) -> Self {
+        Self {
+            policy,
+            local_dev: Mutex::new(FixedWindowState::new()),
+            protected: Mutex::new(FixedWindowState::new()),
+        }
+    }
+
+    fn check(&self, bucket: RateLimitBucket) -> Result<(), AppError> {
+        let state = match bucket {
+            RateLimitBucket::LocalDev => &self.local_dev,
+            RateLimitBucket::Protected => &self.protected,
+        };
+        let mut state = state
+            .lock()
+            .map_err(|_| AppError::internal("rate limiter lock poisoned"))?;
+        let elapsed = state.started_at.elapsed();
+
+        if elapsed >= self.policy.window {
+            state.started_at = Instant::now();
+            state.request_count = 0;
+        }
+
+        if state.request_count >= self.policy.max_requests {
+            return Err(AppError::too_many_requests(
+                format!(
+                    "proof request rate limit exceeded: max {} request(s) per {} second window",
+                    self.policy.max_requests,
+                    self.policy.window.as_secs()
+                ),
+                self.policy.retry_after_seconds(elapsed),
+            ));
+        }
+
+        state.request_count += 1;
+        Ok(())
+    }
+}
+
+impl FixedWindowState {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            request_count: 0,
+        }
     }
 }
 
@@ -509,6 +629,8 @@ async fn main() {
     info!(
         max_in_flight = runtime.execution_policy.max_in_flight,
         request_timeout_secs = runtime.execution_policy.request_timeout.as_secs(),
+        rate_limit_max_requests = runtime.execution_policy.rate_limit.max_requests,
+        rate_limit_window_secs = runtime.execution_policy.rate_limit.window.as_secs(),
         queue_policy = "fail-fast",
         "active /prove execution limits"
     );
@@ -533,15 +655,22 @@ mod tests {
     fn local_dev_app() -> Router {
         app(AppState {
             prove_auth: ProveAuth::Disabled,
-            prove_runtime: ProveRuntime::new(resolve_execution_policy(1, 900)),
+            prove_runtime: ProveRuntime::new(resolve_execution_policy(1, 900, 10, 60)),
         })
     }
 
     fn protected_app() -> Router {
         app(AppState {
             prove_auth: ProveAuth::ApiKey("test-token".to_string()),
-            prove_runtime: ProveRuntime::new(resolve_execution_policy(1, 900)),
+            prove_runtime: ProveRuntime::new(resolve_execution_policy(1, 900, 10, 60)),
         })
+    }
+
+    fn test_rate_limiter(max_requests: usize, window_secs: u64) -> Arc<RateLimiter> {
+        Arc::new(RateLimiter::new(RateLimitPolicy {
+            max_requests,
+            window: Duration::from_secs(window_secs),
+        }))
     }
 
     fn field_from_u32(value: u32) -> Vec<u8> {
@@ -756,6 +885,7 @@ mod tests {
                 max_in_flight: 1,
                 request_timeout: Duration::from_secs(5),
                 retry_after_seconds: 5,
+                rate_limiter: test_rate_limiter(10, 60),
             },
         });
 
@@ -788,6 +918,7 @@ mod tests {
                 max_in_flight: 1,
                 request_timeout: Duration::from_millis(10),
                 retry_after_seconds: 1,
+                rate_limiter: test_rate_limiter(10, 60),
             },
         });
 
@@ -805,6 +936,52 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn prove_rate_limits_authenticated_requests() {
+        let app = app(AppState {
+            prove_auth: ProveAuth::ApiKey("test-token".to_string()),
+            prove_runtime: ProveRuntime {
+                prove_fn: Arc::new(|_| Err(prover::ProveError::ProverFailed("boom".into()))),
+                in_flight: Arc::new(Semaphore::new(1)),
+                max_in_flight: 1,
+                request_timeout: Duration::from_secs(5),
+                retry_after_seconds: 5,
+                rate_limiter: test_rate_limiter(1, 1),
+            },
+        });
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prove")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::from(valid_request_json()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prove")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::from(valid_request_json()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.headers().get(header::RETRY_AFTER).unwrap(), "1");
     }
 
     #[test]
@@ -836,10 +1013,12 @@ mod tests {
 
     #[test]
     fn resolve_execution_policy_uses_expected_values() {
-        let policy = resolve_execution_policy(2, 600);
+        let policy = resolve_execution_policy(2, 600, 10, 60);
 
         assert_eq!(policy.max_in_flight, 2);
         assert_eq!(policy.request_timeout, Duration::from_secs(600));
         assert_eq!(policy.retry_after_seconds(), 600);
+        assert_eq!(policy.rate_limit.max_requests, 10);
+        assert_eq!(policy.rate_limit.window, Duration::from_secs(60));
     }
 }
