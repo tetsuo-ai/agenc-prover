@@ -50,7 +50,18 @@ Authentication:
 - set `PROVER_API_KEY` on the server to define that token
 - only explicit local sidecar mode can disable auth: `PROVER_LOCAL_DEV_MODE=true`
 - local sidecar mode is only allowed when the server binds to loopback
-- `/healthz` stays unauthenticated
+- `/healthz`, `/readyz`, and `/metrics` stay unauthenticated
+
+Execution controls:
+
+- `PROVER_MAX_IN_FLIGHT` limits how many proof requests can run at once
+- `PROVER_REQUEST_TIMEOUT_SECS` bounds how long the HTTP request waits for a proof result
+- `PROVER_RATE_LIMIT_MAX_REQUESTS` caps how many `/prove` calls are accepted per window
+- `PROVER_RATE_LIMIT_WINDOW_SECS` defines that fixed rate-limit window
+- once the rate limit is exceeded, `/prove` returns `429`
+- the server does not queue extra work; once saturated, `/prove` fails fast with `503`
+- timed out requests return `504`
+- `429`, `503`, and `504` include `Retry-After`
 
 Response JSON:
 
@@ -72,8 +83,47 @@ This repository now contains the real proving path:
 - witness-based validation of the public journal fields before proving
 - fail-closed guard if the compiled guest image ID drifts from AgenC's pinned trusted image
 - explicit auth on `/prove`, with startup failure if the service is exposed without credentials
-- health check endpoint
+- in-memory fixed-window rate limiting on `/prove`
+- health, readiness, and metrics endpoints
 - Docker packaging
+
+## Operational Endpoints
+
+### `GET /healthz`
+
+Liveness only. This returns `200` when the process is up.
+
+### `GET /readyz`
+
+Admission readiness. This returns:
+
+- `200` when the prover can admit at least one more proof job
+- `503` when all execution slots are saturated
+
+Response JSON:
+
+```json
+{
+  "ok": true,
+  "service": "agenc-prover-server",
+  "ready": true,
+  "available_slots": 1,
+  "max_in_flight": 1
+}
+```
+
+`ready` is based on proof admission capacity, not just process liveness.
+
+### `GET /metrics`
+
+Prometheus-style plaintext metrics with:
+
+- build identity, including the pinned guest `image_id`
+- readiness and available execution slots
+- configured timeout and rate-limit policy
+- `/prove` request counters for auth failures, bad requests, rate limits, overload, and timeouts
+- proof lifecycle counters for started, completed, succeeded, invalid, and failed jobs
+- aggregate proof duration counters
 
 ## Local Run
 
@@ -81,6 +131,10 @@ Protected mode is now the default:
 
 ```bash
 PROVER_API_KEY=change-me \
+PROVER_MAX_IN_FLIGHT=1 \
+PROVER_REQUEST_TIMEOUT_SECS=900 \
+PROVER_RATE_LIMIT_MAX_REQUESTS=10 \
+PROVER_RATE_LIMIT_WINDOW_SECS=60 \
 cargo run -p agenc-prover-server --features production-prover
 ```
 
@@ -88,6 +142,15 @@ That starts the server on `127.0.0.1:8787` and requires:
 
 ```text
 Authorization: Bearer change-me
+```
+
+Example checks:
+
+```bash
+curl http://127.0.0.1:8787/healthz
+curl http://127.0.0.1:8787/readyz
+curl http://127.0.0.1:8787/metrics
+curl -H 'Authorization: Bearer change-me' http://127.0.0.1:8787/prove
 ```
 
 Explicit local sidecar mode keeps `/prove` unauthenticated, but only on loopback:
@@ -129,9 +192,12 @@ Notes:
   - `r0vm 3.0.5`
   - `risc0-groth16 0.1.0`
 - those pins match the current `risc0-zkvm 3.0.5` / `risc0-build 3.0.5` generation used by this repo
+- default execution policy is one in-flight proof, a 15 minute request timeout, and 10 requests per 60 second window
+- timed out HTTP requests do not cancel the in-progress proof; the work continues until the prover finishes and the slot frees
+- `/readyz` will return `503` whenever that in-flight limit is fully occupied
 
 ## Planned Direction
 
 - local sidecar mode for Linux x86_64 operators
 - later swap `http://127.0.0.1:8787` to hosted endpoints like `https://prover.agenc.tech`
-- add rate limiting and billing without changing the response contract
+- add distributed quotas and billing without changing the response contract
