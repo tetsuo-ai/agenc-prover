@@ -1,5 +1,7 @@
 use std::env;
+use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,6 +30,9 @@ const DEFAULT_PROVER_MAX_IN_FLIGHT: usize = 1;
 const DEFAULT_PROVER_REQUEST_TIMEOUT_SECS: u64 = 900;
 const DEFAULT_PROVER_RATE_LIMIT_MAX_REQUESTS: usize = 10;
 const DEFAULT_PROVER_RATE_LIMIT_WINDOW_SECS: u64 = 60;
+const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+const SERVICE_NAME: &str = "agenc-prover-server";
+const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 type ProveFn =
     dyn Fn(prover::ProveRequest) -> Result<prover::ProveResponse, prover::ProveError> + Send + Sync;
@@ -52,6 +57,7 @@ struct ProveRuntime {
     request_timeout: Duration,
     retry_after_seconds: u64,
     rate_limiter: Arc<RateLimiter>,
+    observability: Arc<Observability>,
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +96,24 @@ struct RuntimeConfig {
     execution_policy: ExecutionPolicy,
 }
 
+struct Observability {
+    request_sequence: AtomicU64,
+    prove_requests_total: AtomicU64,
+    prove_unauthorized_total: AtomicU64,
+    prove_bad_request_total: AtomicU64,
+    prove_rate_limited_total: AtomicU64,
+    prove_overloaded_total: AtomicU64,
+    prove_timeouts_total: AtomicU64,
+    proof_jobs_started_total: AtomicU64,
+    proof_jobs_completed_total: AtomicU64,
+    proof_jobs_succeeded_total: AtomicU64,
+    proof_jobs_invalid_total: AtomicU64,
+    proof_jobs_failed_total: AtomicU64,
+    proof_duration_millis_total: AtomicU64,
+    proof_duration_millis_count: AtomicU64,
+    proofs_in_flight: AtomicUsize,
+}
+
 #[derive(Debug, Deserialize)]
 struct ProveRequest {
     task_pda: Vec<u8>,
@@ -114,6 +138,15 @@ struct ProveResponse {
 struct HealthResponse {
     ok: bool,
     service: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadyResponse {
+    ok: bool,
+    service: &'static str,
+    ready: bool,
+    available_slots: usize,
+    max_in_flight: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -264,6 +297,8 @@ fn vec_to_field(name: &str, bytes: Vec<u8>) -> Result<[u8; FIELD_LEN], AppError>
 fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .route("/prove", post(prove))
         .with_state(state)
 }
@@ -271,8 +306,41 @@ fn app(state: AppState) -> Router {
 async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
-        service: "agenc-prover-server",
+        service: SERVICE_NAME,
     })
+}
+
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    let available_slots = state.prove_runtime.available_slots();
+    let ready = available_slots > 0;
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(ReadyResponse {
+            ok: ready,
+            service: SERVICE_NAME,
+            ready,
+            available_slots,
+            max_in_flight: state.prove_runtime.max_in_flight,
+        }),
+    )
+}
+
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let body = state.prove_runtime.render_metrics();
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(METRICS_CONTENT_TYPE),
+        )],
+        body,
+    )
 }
 
 async fn prove(
@@ -280,28 +348,90 @@ async fn prove(
     headers: HeaderMap,
     Json(request): Json<ProveRequest>,
 ) -> Result<Json<ProveResponse>, AppError> {
-    let rate_limit_bucket = state.prove_auth.authorize(&headers)?;
-    state.prove_runtime.check_rate_limit(rate_limit_bucket)?;
+    let request_id = state.prove_runtime.observability.next_request_id();
+    state.prove_runtime.observability.record_request_received();
 
-    let fixed = request.try_into_fixed()?;
-    let permit = state.prove_runtime.try_acquire()?;
+    let rate_limit_bucket = state.prove_auth.authorize(&headers).map_err(|err| {
+        state.prove_runtime.observability.record_unauthorized();
+        err
+    })?;
+    state.prove_runtime
+        .check_rate_limit(rate_limit_bucket)
+        .map_err(|err| {
+            state.prove_runtime.observability.record_rate_limited();
+            err
+        })?;
+
+    let fixed = request.try_into_fixed().map_err(|err| {
+        state.prove_runtime.observability.record_bad_request();
+        err
+    })?;
+    let permit = state.prove_runtime.try_acquire().map_err(|err| {
+        state.prove_runtime.observability.record_overloaded();
+        err
+    })?;
     let prove_fn = state.prove_runtime.prove_fn.clone();
     let request_timeout = state.prove_runtime.request_timeout;
     let retry_after_seconds = state.prove_runtime.retry_after_seconds;
+    let observability = state.prove_runtime.observability.clone();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let timed_out_for_task = timed_out.clone();
+    observability.record_proof_job_started();
+    info!(
+        request_id,
+        max_in_flight = state.prove_runtime.max_in_flight,
+        request_timeout_secs = request_timeout.as_secs(),
+        "accepted /prove request"
+    );
     let handle = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        prove_fn(fixed)
+        let started_at = Instant::now();
+        let result = prove_fn(fixed);
+        let duration = started_at.elapsed();
+        let client_timed_out = timed_out_for_task.load(Ordering::Relaxed);
+        observability.record_proof_job_finished(&result, duration);
+
+        match &result {
+            Ok(_) => info!(
+                request_id,
+                duration_ms = duration.as_millis() as u64,
+                client_timed_out,
+                "proof job completed successfully"
+            ),
+            Err(prover::ProveError::InvalidRequest(message)) => warn!(
+                request_id,
+                duration_ms = duration.as_millis() as u64,
+                client_timed_out,
+                error = %message,
+                "proof job rejected invalid witness semantics"
+            ),
+            Err(err) => warn!(
+                request_id,
+                duration_ms = duration.as_millis() as u64,
+                client_timed_out,
+                error = %err,
+                "proof job failed"
+            ),
+        }
+
+        result
     });
 
     let response = match tokio::time::timeout(request_timeout, handle).await {
         Ok(joined) => joined
-            .map_err(|err| AppError::internal(format!("prover task join failed: {err}")))?
+            .map_err(|err| {
+                state.prove_runtime.observability.record_proof_job_failed();
+                AppError::internal(format!("prover task join failed: {err}"))
+            })?
             .map_err(|err| match err {
                 prover::ProveError::InvalidRequest(message) => AppError::bad_request(message),
                 other => AppError::internal(other.to_string()),
             })?,
         Err(_) => {
+            timed_out.store(true, Ordering::Relaxed);
+            state.prove_runtime.observability.record_timeout();
             warn!(
+                request_id,
                 request_timeout_secs = request_timeout.as_secs(),
                 "proof request timed out while proving continued in background"
             );
@@ -506,6 +636,7 @@ impl ProveRuntime {
             request_timeout: execution_policy.request_timeout,
             retry_after_seconds: execution_policy.retry_after_seconds(),
             rate_limiter: Arc::new(RateLimiter::new(execution_policy.rate_limit)),
+            observability: Arc::new(Observability::new()),
         }
     }
 
@@ -526,6 +657,19 @@ impl ProveRuntime {
                     self.retry_after_seconds,
                 )
             })
+    }
+
+    fn available_slots(&self) -> usize {
+        self.in_flight.available_permits()
+    }
+
+    fn render_metrics(&self) -> String {
+        self.observability.render_prometheus(
+            self.available_slots(),
+            self.max_in_flight,
+            self.request_timeout,
+            self.rate_limiter.policy,
+        )
     }
 }
 
@@ -584,6 +728,329 @@ impl FixedWindowState {
     }
 }
 
+impl Observability {
+    fn new() -> Self {
+        Self {
+            request_sequence: AtomicU64::new(0),
+            prove_requests_total: AtomicU64::new(0),
+            prove_unauthorized_total: AtomicU64::new(0),
+            prove_bad_request_total: AtomicU64::new(0),
+            prove_rate_limited_total: AtomicU64::new(0),
+            prove_overloaded_total: AtomicU64::new(0),
+            prove_timeouts_total: AtomicU64::new(0),
+            proof_jobs_started_total: AtomicU64::new(0),
+            proof_jobs_completed_total: AtomicU64::new(0),
+            proof_jobs_succeeded_total: AtomicU64::new(0),
+            proof_jobs_invalid_total: AtomicU64::new(0),
+            proof_jobs_failed_total: AtomicU64::new(0),
+            proof_duration_millis_total: AtomicU64::new(0),
+            proof_duration_millis_count: AtomicU64::new(0),
+            proofs_in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn next_request_id(&self) -> u64 {
+        self.request_sequence.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn record_request_received(&self) {
+        self.prove_requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_unauthorized(&self) {
+        self.prove_unauthorized_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_bad_request(&self) {
+        self.prove_bad_request_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rate_limited(&self) {
+        self.prove_rate_limited_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_overloaded(&self) {
+        self.prove_overloaded_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_timeout(&self) {
+        self.prove_timeouts_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_proof_job_started(&self) {
+        self.proof_jobs_started_total.fetch_add(1, Ordering::Relaxed);
+        self.proofs_in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_proof_job_failed(&self) {
+        self.proof_jobs_completed_total.fetch_add(1, Ordering::Relaxed);
+        self.proof_jobs_failed_total.fetch_add(1, Ordering::Relaxed);
+        self.proofs_in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn record_proof_job_finished(
+        &self,
+        result: &Result<prover::ProveResponse, prover::ProveError>,
+        duration: Duration,
+    ) {
+        self.proof_jobs_completed_total.fetch_add(1, Ordering::Relaxed);
+        self.proof_duration_millis_total
+            .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+        self.proof_duration_millis_count
+            .fetch_add(1, Ordering::Relaxed);
+        match result {
+            Ok(_) => {
+                self.proof_jobs_succeeded_total.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(prover::ProveError::InvalidRequest(_)) => {
+                self.proof_jobs_invalid_total.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.proof_jobs_failed_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.proofs_in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn render_prometheus(
+        &self,
+        available_slots: usize,
+        max_in_flight: usize,
+        request_timeout: Duration,
+        rate_limit_policy: RateLimitPolicy,
+    ) -> String {
+        let ready = usize::from(available_slots > 0);
+        let image_id = prover::render_image_id(prover::image_id());
+        let mut body = String::new();
+
+        write_metric_help(
+            &mut body,
+            "agenc_prover_build_info",
+            "Build information for the prover binary.",
+            "gauge",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_build_info{{version=\"{}\",image_id=\"{}\"}} 1",
+            BUILD_VERSION, image_id
+        );
+
+        write_metric_help(
+            &mut body,
+            "agenc_prover_ready",
+            "Whether the prover can admit at least one more proof request.",
+            "gauge",
+        );
+        let _ = writeln!(body, "agenc_prover_ready {ready}");
+        write_metric_help(
+            &mut body,
+            "agenc_prover_available_slots",
+            "Available proof admission slots right now.",
+            "gauge",
+        );
+        let _ = writeln!(body, "agenc_prover_available_slots {available_slots}");
+        write_metric_help(
+            &mut body,
+            "agenc_prover_max_in_flight",
+            "Configured maximum number of in-flight proof jobs.",
+            "gauge",
+        );
+        let _ = writeln!(body, "agenc_prover_max_in_flight {max_in_flight}");
+        write_metric_help(
+            &mut body,
+            "agenc_prover_request_timeout_seconds",
+            "Configured HTTP request timeout for /prove.",
+            "gauge",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_request_timeout_seconds {}",
+            request_timeout.as_secs()
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_rate_limit_max_requests",
+            "Configured max /prove requests per rate-limit window.",
+            "gauge",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_rate_limit_max_requests {}",
+            rate_limit_policy.max_requests
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_rate_limit_window_seconds",
+            "Configured /prove fixed-window rate-limit duration in seconds.",
+            "gauge",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_rate_limit_window_seconds {}",
+            rate_limit_policy.window.as_secs()
+        );
+
+        write_metric_help(
+            &mut body,
+            "agenc_prover_prove_requests_total",
+            "Total HTTP /prove requests received.",
+            "counter",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_prove_requests_total {}",
+            self.prove_requests_total.load(Ordering::Relaxed)
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_prove_unauthorized_total",
+            "Total /prove requests rejected for missing or invalid auth.",
+            "counter",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_prove_unauthorized_total {}",
+            self.prove_unauthorized_total.load(Ordering::Relaxed)
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_prove_bad_request_total",
+            "Total /prove requests rejected as bad requests before proving.",
+            "counter",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_prove_bad_request_total {}",
+            self.prove_bad_request_total.load(Ordering::Relaxed)
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_prove_rate_limited_total",
+            "Total /prove requests rejected by rate limiting.",
+            "counter",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_prove_rate_limited_total {}",
+            self.prove_rate_limited_total.load(Ordering::Relaxed)
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_prove_overloaded_total",
+            "Total /prove requests rejected because the prover was saturated.",
+            "counter",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_prove_overloaded_total {}",
+            self.prove_overloaded_total.load(Ordering::Relaxed)
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_prove_timeouts_total",
+            "Total /prove HTTP requests that timed out while the proof kept running.",
+            "counter",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_prove_timeouts_total {}",
+            self.prove_timeouts_total.load(Ordering::Relaxed)
+        );
+
+        write_metric_help(
+            &mut body,
+            "agenc_prover_proof_jobs_in_flight",
+            "Current number of proof jobs occupying execution slots.",
+            "gauge",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_proof_jobs_in_flight {}",
+            self.proofs_in_flight.load(Ordering::Relaxed)
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_proof_jobs_started_total",
+            "Total proof jobs admitted to execution.",
+            "counter",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_proof_jobs_started_total {}",
+            self.proof_jobs_started_total.load(Ordering::Relaxed)
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_proof_jobs_completed_total",
+            "Total proof jobs that reached a terminal result.",
+            "counter",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_proof_jobs_completed_total {}",
+            self.proof_jobs_completed_total.load(Ordering::Relaxed)
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_proof_jobs_succeeded_total",
+            "Total proof jobs that completed successfully.",
+            "counter",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_proof_jobs_succeeded_total {}",
+            self.proof_jobs_succeeded_total.load(Ordering::Relaxed)
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_proof_jobs_invalid_total",
+            "Total proof jobs rejected for invalid witness semantics.",
+            "counter",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_proof_jobs_invalid_total {}",
+            self.proof_jobs_invalid_total.load(Ordering::Relaxed)
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_proof_jobs_failed_total",
+            "Total proof jobs that failed internally.",
+            "counter",
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_proof_jobs_failed_total {}",
+            self.proof_jobs_failed_total.load(Ordering::Relaxed)
+        );
+        write_metric_help(
+            &mut body,
+            "agenc_prover_proof_duration_seconds",
+            "End-to-end proof job duration in seconds.",
+            "summary",
+        );
+        let duration_sum_seconds =
+            self.proof_duration_millis_total.load(Ordering::Relaxed) as f64 / 1000.0;
+        let _ = writeln!(
+            body,
+            "agenc_prover_proof_duration_seconds_sum {:.3}",
+            duration_sum_seconds
+        );
+        let _ = writeln!(
+            body,
+            "agenc_prover_proof_duration_seconds_count {}",
+            self.proof_duration_millis_count.load(Ordering::Relaxed)
+        );
+
+        body
+    }
+}
+
+fn write_metric_help(body: &mut String, name: &str, help: &str, kind: &str) {
+    let _ = writeln!(body, "# HELP {name} {help}");
+    let _ = writeln!(body, "# TYPE {name} {kind}");
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -618,6 +1085,11 @@ async fn main() {
         "agenc-prover-server listening on {}",
         listener.local_addr().unwrap()
     );
+    info!(
+        version = BUILD_VERSION,
+        trusted_image_id = %prover::render_image_id(prover::image_id()),
+        "active prover build identity"
+    );
     match &state.prove_auth {
         ProveAuth::Disabled => info!(
             "{PROVER_LOCAL_DEV_MODE_ENV}=true; /prove is running without auth on loopback"
@@ -646,7 +1118,7 @@ mod tests {
         compute_binding, compute_constraint_hash, compute_nullifier_from_agent_secret,
         compute_output_commitment,
     };
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use std::net::Ipv4Addr;
     use std::sync::Arc;
@@ -738,6 +1210,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_returns_ok_when_capacity_is_available() {
+        let response = local_dev_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_returns_service_unavailable_when_saturated() {
+        let app = app(AppState {
+            prove_auth: ProveAuth::Disabled,
+            prove_runtime: ProveRuntime {
+                prove_fn: Arc::new(|_| unreachable!("readyz should not enter prover")),
+                in_flight: Arc::new(Semaphore::new(0)),
+                max_in_flight: 1,
+                request_timeout: Duration::from_secs(5),
+                retry_after_seconds: 5,
+                rate_limiter: test_rate_limiter(10, 60),
+                observability: Arc::new(Observability::new()),
+            },
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -886,10 +1401,12 @@ mod tests {
                 request_timeout: Duration::from_secs(5),
                 retry_after_seconds: 5,
                 rate_limiter: test_rate_limiter(10, 60),
+                observability: Arc::new(Observability::new()),
             },
         });
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -903,6 +1420,20 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "5");
+
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(metrics.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("agenc_prover_prove_overloaded_total 1"));
     }
 
     #[tokio::test]
@@ -919,6 +1450,7 @@ mod tests {
                 request_timeout: Duration::from_millis(10),
                 retry_after_seconds: 1,
                 rate_limiter: test_rate_limiter(10, 60),
+                observability: Arc::new(Observability::new()),
             },
         });
 
@@ -949,6 +1481,7 @@ mod tests {
                 request_timeout: Duration::from_secs(5),
                 retry_after_seconds: 5,
                 rate_limiter: test_rate_limiter(1, 1),
+                observability: Arc::new(Observability::new()),
             },
         });
 
@@ -982,6 +1515,33 @@ mod tests {
         assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(second.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn metrics_expose_build_identity_and_runtime_limits() {
+        let response = local_dev_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            METRICS_CONTENT_TYPE
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("agenc_prover_build_info"));
+        assert!(body.contains("agenc_prover_ready 1"));
+        assert!(body.contains("agenc_prover_max_in_flight 1"));
+        assert!(body.contains("agenc_prover_prove_requests_total 0"));
+        assert!(body.contains("agenc_prover_proof_jobs_started_total 0"));
     }
 
     #[test]
