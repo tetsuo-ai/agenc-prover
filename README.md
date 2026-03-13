@@ -130,6 +130,38 @@ Notes:
   - `risc0-groth16 0.1.0`
 - those pins match the current `risc0-zkvm 3.0.5` / `risc0-build 3.0.5` generation used by this repo
 
+## Production Verification Gate
+
+Release verification for the production prover is now pinned to the shared assumptions in:
+
+```text
+scripts/production-toolchain.env
+```
+
+That file is consumed by:
+
+- the Docker build
+- local Linux `x86_64` verification scripts
+- the GitHub Actions production verification workflow
+
+Reproduce the release gate locally on Linux `x86_64`:
+
+```bash
+rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy
+rustup default 1.90.0
+./scripts/install-production-toolchain.sh
+cargo build --release -p agenc-prover-server --features production-prover
+./scripts/verify-production-image-id.sh ./target/release/agenc-prover-server
+./scripts/write-build-metadata.sh dist/production-build-metadata.json ./target/release/agenc-prover-server
+sha256sum ./target/release/agenc-prover-server > dist/agenc-prover-server.sha256
+```
+
+The GitHub Actions workflow at `.github/workflows/production-prover-verification.yml` rebuilds the prover on Linux `x86_64`, checks the computed image ID against `TRUSTED_RISC0_IMAGE_ID`, and uploads:
+
+- `dist/production-build-metadata.json`
+- `dist/agenc-prover-image-id.txt`
+- `dist/agenc-prover-server.sha256`
+
 ## Planned Direction
 
 - local sidecar mode for Linux x86_64 operators
