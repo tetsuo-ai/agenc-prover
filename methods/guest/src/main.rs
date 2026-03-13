@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use agenc_zkvm_guest::{serialize_journal, JournalFields, JOURNAL_FIELD_LEN};
+use agenc_zkvm_guest::{serialize_journal, JournalFields, PrivateWitness, JOURNAL_FIELD_LEN};
 use risc0_zkvm::guest::env;
 
 fn main() {
@@ -10,11 +10,12 @@ fn main() {
     let output_commitment: [u8; JOURNAL_FIELD_LEN] = env::read();
     let binding: [u8; JOURNAL_FIELD_LEN] = env::read();
     let nullifier: [u8; JOURNAL_FIELD_LEN] = env::read();
-
-    let zero = [0u8; JOURNAL_FIELD_LEN];
-    assert!(output_commitment != zero, "output_commitment must be non-zero");
-    assert!(binding != zero, "binding must be non-zero");
-    assert!(nullifier != zero, "nullifier must be non-zero");
+    let output_0: [u8; JOURNAL_FIELD_LEN] = env::read();
+    let output_1: [u8; JOURNAL_FIELD_LEN] = env::read();
+    let output_2: [u8; JOURNAL_FIELD_LEN] = env::read();
+    let output_3: [u8; JOURNAL_FIELD_LEN] = env::read();
+    let salt: [u8; JOURNAL_FIELD_LEN] = env::read();
+    let agent_secret: [u8; JOURNAL_FIELD_LEN] = env::read();
 
     let fields = JournalFields {
         task_pda,
@@ -24,5 +25,15 @@ fn main() {
         binding,
         nullifier,
     };
+    let witness = PrivateWitness {
+        output: [output_0, output_1, output_2, output_3],
+        salt,
+        agent_secret,
+    };
+
+    if let Err(err) = fields.validate_against_witness(&witness) {
+        panic!("{err}");
+    }
+
     env::commit_slice(&serialize_journal(&fields));
 }
