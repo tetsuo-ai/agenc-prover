@@ -44,6 +44,14 @@ The request now includes the private witness needed to prove the statement:
 
 If any public field does not match the witness-derived value, `/prove` returns `400`.
 
+Authentication:
+
+- `/prove` requires `Authorization: Bearer <token>` by default
+- set `PROVER_API_KEY` on the server to define that token
+- only explicit local sidecar mode can disable auth: `PROVER_LOCAL_DEV_MODE=true`
+- local sidecar mode is only allowed when the server binds to loopback
+- `/healthz` stays unauthenticated
+
 Response JSON:
 
 ```json
@@ -63,16 +71,31 @@ This repository now contains the real proving path:
 - Groth16 proof generation
 - witness-based validation of the public journal fields before proving
 - fail-closed guard if the compiled guest image ID drifts from AgenC's pinned trusted image
+- explicit auth on `/prove`, with startup failure if the service is exposed without credentials
 - health check endpoint
 - Docker packaging
 
 ## Local Run
 
+Protected mode is now the default:
+
 ```bash
+PROVER_API_KEY=change-me \
 cargo run -p agenc-prover-server --features production-prover
 ```
 
-By default the server binds to `127.0.0.1:8787`.
+That starts the server on `127.0.0.1:8787` and requires:
+
+```text
+Authorization: Bearer change-me
+```
+
+Explicit local sidecar mode keeps `/prove` unauthenticated, but only on loopback:
+
+```bash
+PROVER_LOCAL_DEV_MODE=true \
+cargo run -p agenc-prover-server --features production-prover
+```
 
 Print the compiled image ID:
 
@@ -85,6 +108,7 @@ cargo run -p agenc-prover-server --features production-prover -- image-id
 ```bash
 docker build -t agenc-prover .
 docker run --rm \
+  -e PROVER_API_KEY=change-me \
   -p 8787:8787 \
   -v /var/run/docker.sock:/var/run/docker.sock \
   agenc-prover
@@ -95,9 +119,10 @@ Notes:
 - the current RISC Zero Groth16 path needs Linux `x86_64`
 - the container needs the host Docker socket because local Groth16 proving uses Docker under the hood
 - this is meant to run as a local sidecar or an operator-managed prover service, not inside the main AgenC app process
+- because the Docker image binds `0.0.0.0`, it will refuse to start without `PROVER_API_KEY`
 
 ## Planned Direction
 
 - local sidecar mode for Linux x86_64 operators
 - later swap `http://127.0.0.1:8787` to hosted endpoints like `https://prover.agenc.tech`
-- add auth, rate limiting, and billing without changing the response contract
+- add rate limiting and billing without changing the response contract
