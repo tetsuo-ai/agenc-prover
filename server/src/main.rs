@@ -1114,12 +1114,9 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agenc_zkvm_guest::{
-        compute_binding, compute_constraint_hash, compute_nullifier_from_agent_secret,
-        compute_output_commitment,
-    };
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
+    use std::fs;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -1145,56 +1142,31 @@ mod tests {
         }))
     }
 
-    fn field_from_u32(value: u32) -> Vec<u8> {
-        let mut out = vec![0_u8; FIELD_LEN];
-        out[28..].copy_from_slice(&value.to_be_bytes());
-        out
+    fn benchmark_fixture_path() -> &'static str {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/prove-benchmark-request.json"
+        )
     }
 
     fn valid_request_json() -> String {
-        let mut task_pda = vec![0_u8; FIELD_LEN];
-        task_pda[31] = 0x2a;
-        let agent_authority = (1u8..=32u8).collect::<Vec<_>>();
-        let output = vec![
-            field_from_u32(1),
-            field_from_u32(2),
-            field_from_u32(3),
-            field_from_u32(4),
-        ];
-        let output_fields = [
-            vec_to_field("output[0]", output[0].clone()).unwrap(),
-            vec_to_field("output[1]", output[1].clone()).unwrap(),
-            vec_to_field("output[2]", output[2].clone()).unwrap(),
-            vec_to_field("output[3]", output[3].clone()).unwrap(),
-        ];
-        let salt = field_from_u32(12345);
-        let agent_secret = field_from_u32(67890);
-        let constraint_hash = compute_constraint_hash(&output_fields);
-        let output_commitment =
-            compute_output_commitment(&output_fields, &vec_to_field("salt", salt.clone()).unwrap());
-        let binding = compute_binding(
-            &vec_to_field("task_pda", task_pda.clone()).unwrap(),
-            &vec_to_field("agent_authority", agent_authority.clone()).unwrap(),
-            &output_commitment,
-        );
-        let nullifier = compute_nullifier_from_agent_secret(
-            &constraint_hash,
-            &output_commitment,
-            &vec_to_field("agent_secret", agent_secret.clone()).unwrap(),
-        );
+        fs::read_to_string(benchmark_fixture_path()).expect("benchmark fixture must exist")
+    }
 
-        serde_json::json!({
-            "task_pda": task_pda,
-            "agent_authority": agent_authority,
-            "constraint_hash": constraint_hash,
-            "output_commitment": output_commitment,
-            "binding": binding,
-            "nullifier": nullifier,
-            "output": output,
-            "salt": salt,
-            "agent_secret": agent_secret
-        })
-        .to_string()
+    #[test]
+    fn benchmark_fixture_is_a_valid_semantic_request() {
+        let request: ProveRequest = serde_json::from_str(&valid_request_json())
+            .expect("benchmark fixture must deserialize");
+        let fixed = request
+            .try_into_fixed()
+            .expect("benchmark fixture must have correct field widths");
+
+        assert_eq!(
+            fixed
+                .journal_fields()
+                .validate_against_witness(&fixed.private_witness()),
+            Ok(())
+        );
     }
 
     #[tokio::test]
