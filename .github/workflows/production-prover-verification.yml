@@ -61,15 +61,17 @@ jobs:
           set -euo pipefail
           . ./scripts/production-toolchain.env
           rustup toolchain install "${HOST_RUST_VERSION}" --profile minimal --component rustfmt --component clippy
-          rustup default "${HOST_RUST_VERSION}"
-          rustc --version
-          cargo --version
+          rustc +"${HOST_RUST_VERSION}" --version
+          cargo +"${HOST_RUST_VERSION}" --version
 
       - name: Install pinned production prover toolchain
         run: ./scripts/install-production-toolchain.sh
 
       - name: Build production prover
-        run: cargo build --release -p agenc-prover-server --features production-prover
+        run: |
+          set -euo pipefail
+          . ./scripts/production-toolchain.env
+          cargo +"${HOST_RUST_VERSION}" build --release -p agenc-prover-server --features production-prover
 
       - name: Verify trusted image id
         run: ./scripts/verify-production-image-id.sh
