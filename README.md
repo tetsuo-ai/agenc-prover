@@ -230,6 +230,80 @@ The GitHub Actions workflow at `.github/workflows/production-prover-verification
 - `dist/agenc-prover-image-id.txt`
 - `dist/agenc-prover-server.sha256`
 
+## Proof Benchmark
+
+The checked-in latency source of truth is:
+
+```text
+scripts/benchmark-prove.sh
+```
+
+It runs one or more real `/prove` requests and emits newline-delimited JSON with elapsed time and proof artifact shape.
+
+Single-trial example:
+
+```bash
+PROVER_API_KEY=change-me \
+./scripts/benchmark-prove.sh --url http://127.0.0.1:8787
+```
+
+Multi-trial example for median and worst-case timing:
+
+```bash
+PROVER_API_KEY=change-me \
+./scripts/benchmark-prove.sh --url http://127.0.0.1:8787 --trials 3
+```
+
+Each trial line includes:
+
+- `elapsed_ms` and `elapsed_seconds`
+- `journal_len`
+- `seal_bytes_len`
+- returned `image_id`
+
+The final summary line includes:
+
+- `median_elapsed_ms`
+- `best_elapsed_ms`
+- `worst_elapsed_ms`
+
+The default request payload lives at:
+
+```text
+scripts/prove-benchmark-request.json
+```
+
+That fixture is also covered by the server test suite so the benchmark request stays semantically valid.
+
+## Timeout Guidance
+
+As of March 14, 2026, the checked-in benchmark flow was validated on the Linux `x86_64` prover host with `2` sequential real `/prove` trials:
+
+- trial 1: `180.873s`
+- trial 2: `180.259s`
+- median: `180.566s`
+- worst-case in that run: `180.873s`
+- `journal_len = 192`
+- `seal_bytes_len = 260`
+
+Tested hardware class for that run:
+
+- Ubuntu Linux `x86_64`
+- `8` vCPU
+- Intel(R) Xeon(R) CPU E3-1270 v6 @ `3.80GHz`
+- `31 GiB` RAM
+
+Current operating guidance:
+
+- keep `PROVER_REQUEST_TIMEOUT_SECS=900` as the server-side baseline on that hardware class
+- set client timeouts higher than the server budget so clients receive the server's `504` and `Retry-After` instead of aborting early
+- with the current `900s` server timeout, use a client timeout of at least `960s` as the default budget
+- when benchmarking a new host class, run at least `3` trials and treat the summary median and worst-case timing as the local source of truth
+- if the worst-case timing is regularly close to or above `900s`, treat that as a host-capacity or regression signal for interactive use
+- respect `Retry-After` on `429`, `503`, and `504`; do not immediately retry into a saturated prover
+
+The hardware listed above is the current validated baseline, not a claimed lower bound for all operator-managed deployments. The benchmark script is now the source of truth for latency expectations; older one-off manual timings should be treated as anecdotal.
+
 ## Planned Direction
 
 - local sidecar mode for Linux x86_64 operators
