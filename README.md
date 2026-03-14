@@ -87,6 +87,70 @@ This repository now contains the real proving path:
 - health, readiness, and metrics endpoints
 - Docker packaging
 
+## Operator Runbook
+
+This section is the operator-facing source of truth for how `agenc-prover` should be deployed and how it should be taken out of service safely.
+
+### Deployment Mode Matrix
+
+| Pattern | Status | Use it when | Requirements / caveats |
+| --- | --- | --- | --- |
+| Local sidecar on loopback | Supported | AgenC and the prover run on the same trusted machine | Keep the default loopback bind, use `PROVER_LOCAL_DEV_MODE=true` only on loopback, and treat Linux `x86_64` as the real proving platform |
+| Operator-managed service on Linux `x86_64` | Supported | Multiple trusted callers need one shared prover service | Set `PROVER_API_KEY`, monitor `/readyz` and `/metrics`, and keep the timeout / rate-limit controls enabled |
+| Hosted public service with extra control-plane layers | Experimental | You are adding your own reverse proxy, auth perimeter, quotas, and SRE automation | The core prover can sit behind this, but this repo does not yet ship the full hosting control plane |
+| Apple Silicon or any non-Linux-`x86_64` proving host | Unsupported | Never for the canonical real proving path | Use a remote Linux `x86_64` prover host instead |
+| Public bind without auth, or any off-loopback `PROVER_LOCAL_DEV_MODE=true` setup | Unsafe | Never | Startup should refuse this configuration; do not work around it |
+| Containerized prover without the host Docker socket | Unsupported | Never for the current Groth16 path | Local Groth16 proving currently depends on the host Docker socket |
+
+### Bind-Host Behavior
+
+- bare `cargo run` defaults to `127.0.0.1:8787`
+- the Docker image sets `PROVER_HOST=0.0.0.0` and `PROVER_PORT=8787` so the container can accept forwarded traffic
+- because the Docker image changes the bind host from loopback to `0.0.0.0`, the containerized service must keep auth enabled
+- the historical "`/prove` can come up exposed" caveat from before `#3` is no longer the intended behavior; the current startup guard should refuse any non-loopback unauthenticated deployment
+
+### Safe Startup Checklist
+
+1. Pick a supported deployment mode:
+   - loopback local sidecar
+   - operator-managed Linux `x86_64` service
+2. Confirm the platform constraints before proving:
+   - real proving path is Linux `x86_64`
+   - Docker-packaged proving needs the host Docker socket mounted
+3. Start the server with explicit execution controls and, unless you are on loopback local-dev mode, `PROVER_API_KEY`
+4. Print the compiled guest image id and confirm it matches the pinned trusted value:
+
+```bash
+cargo run -p agenc-prover-server --features production-prover -- image-id
+```
+
+5. Validate the operational endpoints before sending proof traffic:
+
+```bash
+curl http://127.0.0.1:8787/healthz
+curl http://127.0.0.1:8787/readyz
+curl http://127.0.0.1:8787/metrics
+```
+
+6. Confirm the service is actually protected the way you expect:
+   - local sidecar mode should stay on loopback only
+   - operator-managed service should require `Authorization: Bearer <token>` on `/prove`
+7. Use the proof benchmark and timeout guidance in the sections below as the latency baseline; do not invent lower budgets from intuition
+
+### Safe Disable / Rollback
+
+If the prover becomes unhealthy or starts missing its latency envelope:
+
+1. Stop sending new proof traffic to the instance:
+   - remove it from the load balancer, or
+   - point callers away from it, or
+   - stop the container / process if you need an immediate hard cut
+2. Respect `Retry-After` on `429`, `503`, and `504`; do not hammer retries into a saturated prover
+3. Check `/readyz` and `agenc_prover_proof_jobs_in_flight` in `/metrics`
+4. If the service is still running and `in_flight > 0`, let the current proof work settle before restarting when possible
+5. Remember that HTTP timeout does not cancel proving; a `504` means the client gave up waiting, not that the prover slot is already free
+6. If you roll back to a last-known-good build, rerun the image-id check plus `/healthz`, `/readyz`, and `/metrics` before restoring traffic
+
 ## Operational Endpoints
 
 ### `GET /healthz`
