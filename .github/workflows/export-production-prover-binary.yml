@@ -1,0 +1,86 @@
+name: Export Production Prover Binary
+
+on:
+  push:
+    branches:
+      - codex/export-production-prover-binary
+    paths:
+      - ".github/workflows/export-production-prover-binary.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - "README.md"
+      - "guest/**"
+      - "methods/**"
+      - "rust-toolchain.toml"
+      - "scripts/**"
+      - "server/**"
+  workflow_dispatch:
+
+jobs:
+  linux-x86_64-export-binary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Add cargo and risc0 binaries to PATH
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            cmake \
+            libssl-dev \
+            pkg-config
+
+      - name: Install pinned host Rust toolchain
+        run: |
+          set -euo pipefail
+          . ./scripts/production-toolchain.env
+          rustup toolchain install "${HOST_RUST_VERSION}" --profile minimal --component rustfmt --component clippy
+          rustup default "${HOST_RUST_VERSION}"
+          rustc --version
+          cargo --version
+
+      - name: Install pinned production prover toolchain
+        run: ./scripts/install-production-toolchain.sh
+
+      - name: Build production prover
+        run: cargo build --release -p agenc-prover-server --features production-prover
+
+      - name: Verify trusted image id
+        run: ./scripts/verify-production-image-id.sh
+
+      - name: Package binary artifact
+        run: |
+          mkdir -p dist
+          cp target/release/agenc-prover-server dist/agenc-prover-server
+          dist/agenc-prover-server image-id > dist/agenc-prover-image-id.txt
+          sha256sum dist/agenc-prover-server > dist/agenc-prover-server.sha256
+          ./scripts/write-build-metadata.sh dist/production-build-metadata.json dist/agenc-prover-server
+          tar -C dist -czf dist/agenc-prover-linux-x86_64.tgz \
+            agenc-prover-server \
+            agenc-prover-image-id.txt \
+            agenc-prover-server.sha256 \
+            production-build-metadata.json
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-prover-linux-x86_64-binary
+          path: |
+            dist/agenc-prover-linux-x86_64.tgz
+            dist/agenc-prover-image-id.txt
+            dist/agenc-prover-server.sha256
+            dist/production-build-metadata.json
