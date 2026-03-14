@@ -15,8 +15,8 @@ pub const SEAL_BYTES_LEN: usize = 260;
 pub const TRUSTED_SEAL_SELECTOR: [u8; SEAL_SELECTOR_LEN] = [0x52, 0x5a, 0x56, 0x4d];
 pub const DEV_MODE_ENV_VAR: &str = "RISC0_DEV_MODE";
 pub const TRUSTED_RISC0_IMAGE_ID: [u8; IMAGE_ID_LEN] = [
-    249, 171, 141, 23, 213, 220, 58, 181, 70, 229, 180, 85, 169, 69, 100, 52, 41, 238, 19, 96, 86,
-    167, 115, 3, 253, 84, 35, 232, 201, 242, 18, 188,
+    83, 20, 191, 75, 31, 98, 93, 22, 32, 232, 83, 243, 159, 37, 226, 133, 238, 23, 147, 20, 56, 24,
+    100, 146, 205, 180, 76, 222, 38, 140, 129, 7,
 ];
 
 pub type ImageId = [u8; IMAGE_ID_LEN];
