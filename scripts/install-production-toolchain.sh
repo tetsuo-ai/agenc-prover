@@ -11,7 +11,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-cargo install --locked --version "${RZUP_VERSION}" rzup
+cargo +"${HOST_RUST_VERSION}" install --locked --version "${RZUP_VERSION}" rzup
 
 rzup install rust "${RISC0_RUST_VERSION}"
 rzup install cpp "${RISC0_CPP_VERSION}"
