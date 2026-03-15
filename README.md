@@ -339,6 +339,49 @@ scripts/prove-benchmark-request.json
 
 That fixture is also covered by the server test suite so the benchmark request stays semantically valid.
 
+## CUDA Bring-Up
+
+An opt-in CUDA proving build is available via:
+
+```bash
+cargo run -p agenc-prover-server --features production-prover-cuda
+```
+
+That keeps the default CPU-oriented `production-prover` path unchanged while enabling `risc0-zkvm/cuda` on Linux hosts with a supported NVIDIA CUDA stack.
+
+If the host exposes more than one GPU, set:
+
+```bash
+RISC0_DEFAULT_PROVER_NUM_GPUS=<N>
+```
+
+before starting the server. RISC Zero forwards that value to the local `r0vm` prover cluster as `--num-gpus`.
+
+Before spending time on `/prove` benchmarks for a candidate GPU host, inspect the machine with:
+
+```bash
+./scripts/check-cuda-host.sh
+```
+
+The script emits one JSON object and exits `0` only when the host has:
+
+- a visible NVIDIA GPU
+- proprietary `nvidia` kernel modules instead of `nouveau`
+- `/dev/nvidia*` device nodes
+- a working `nvidia-smi`
+- a working `nvcc`
+
+Current remote pre-cloud bring-up findings as of March 14, 2026:
+
+- Ubuntu `24.04 LTS`
+- NVIDIA `GeForce GT 710 (GK208B)`
+- Ubuntu recommends `nvidia-driver-470`
+- current blocker state: `nouveau` is loaded, `nvidia-smi` is missing, `nvcc` is missing, and `/dev/nvidia*` is absent
+- NVIDIA lists `GeForce GT 710` in the [Kepler desktop family](https://nvidia.custhelp.com/app/answers/detail/a_id/5204/~/list-of-kepler-series-geforce-desktop-gpus), and its [CUDA toolkit / driver / architecture matrix](https://docs.nvidia.com/datacenter/tesla/drivers/cuda-toolkit-driver-and-architecture-matrix.html) lists Kepler's last supported toolkit as `11.x` and last driver branch as `R470`
+- Ubuntu `24.04` currently exposes `nvidia-cuda-toolkit` `12.0`, so this host is not a viable modern CUDA proving target for this repo
+
+Treat that older box as a driver-path diagnostic host only. Use newer NVIDIA hardware for any real CUDA-backed `/prove` benchmark that is meant to inform H100 or H200 planning.
+
 ## Timeout Guidance
 
 As of March 14, 2026, the checked-in benchmark flow was validated on the Linux `x86_64` prover host with `2` sequential real `/prove` trials:
