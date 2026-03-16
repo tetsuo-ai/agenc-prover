@@ -13,10 +13,18 @@ pub const SEAL_PROOF_LEN: usize = 256;
 pub const SEAL_BYTES_LEN: usize = 260;
 #[cfg_attr(not(any(test, feature = "production-prover")), allow(dead_code))]
 pub const TRUSTED_SEAL_SELECTOR: [u8; SEAL_SELECTOR_LEN] = [0x52, 0x5a, 0x56, 0x4d];
+#[cfg_attr(not(any(test, feature = "production-prover")), allow(dead_code))]
+const GROTH16_PI_A_LEN: usize = 64;
+#[cfg_attr(not(any(test, feature = "production-prover")), allow(dead_code))]
+const BN254_FIELD_MODULUS_Q: [u8; 32] = [
+    0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58,
+    0x5d, 0x97, 0x81, 0x6a, 0x91, 0x68, 0x71, 0xca, 0x8d, 0x3c, 0x20, 0x8c, 0x16, 0xd8, 0x7c,
+    0xfd, 0x47,
+];
 pub const DEV_MODE_ENV_VAR: &str = "RISC0_DEV_MODE";
 pub const TRUSTED_RISC0_IMAGE_ID: [u8; IMAGE_ID_LEN] = [
-    83, 20, 191, 75, 31, 98, 93, 22, 32, 232, 83, 243, 159, 37, 226, 133, 238, 23, 147, 20, 56, 24,
-    100, 146, 205, 180, 76, 222, 38, 140, 129, 7,
+    163, 162, 235, 60, 222, 160, 40, 184, 182, 95, 135, 53, 39, 239, 42, 88, 52, 171, 21, 130, 15,
+    219, 143, 17, 216, 26, 185, 77, 94, 34, 68, 20,
 ];
 
 pub type ImageId = [u8; IMAGE_ID_LEN];
@@ -257,8 +265,48 @@ pub fn guest_id_to_image_id(guest_id: &[u32; 8]) -> ImageId {
 fn encode_seal(proof_bytes: &[u8; SEAL_PROOF_LEN]) -> Vec<u8> {
     let mut seal_bytes = Vec::with_capacity(SEAL_BYTES_LEN);
     seal_bytes.extend_from_slice(&TRUSTED_SEAL_SELECTOR);
-    seal_bytes.extend_from_slice(proof_bytes);
+    seal_bytes.extend_from_slice(&negate_pi_a(proof_bytes));
     seal_bytes
+}
+
+#[cfg_attr(not(any(test, feature = "production-prover")), allow(dead_code))]
+fn negate_pi_a(proof_bytes: &[u8; SEAL_PROOF_LEN]) -> [u8; SEAL_PROOF_LEN] {
+    let mut encoded = *proof_bytes;
+    let pi_a: [u8; GROTH16_PI_A_LEN] = encoded[..GROTH16_PI_A_LEN]
+        .try_into()
+        .expect("pi_a length is fixed");
+    encoded[..GROTH16_PI_A_LEN].copy_from_slice(&negate_g1(&pi_a));
+    encoded
+}
+
+#[cfg_attr(not(any(test, feature = "production-prover")), allow(dead_code))]
+fn negate_g1(point: &[u8; GROTH16_PI_A_LEN]) -> [u8; GROTH16_PI_A_LEN] {
+    let mut negated = [0u8; GROTH16_PI_A_LEN];
+    negated[..32].copy_from_slice(&point[..32]);
+
+    let mut y = [0u8; 32];
+    y.copy_from_slice(&point[32..]);
+
+    let negated_y = if y.iter().all(|byte| *byte == 0) {
+        [0u8; 32]
+    } else {
+        let mut value = BN254_FIELD_MODULUS_Q;
+        subtract_be_bytes(&mut value, &y);
+        value
+    };
+    negated[32..].copy_from_slice(&negated_y);
+
+    negated
+}
+
+#[cfg_attr(not(any(test, feature = "production-prover")), allow(dead_code))]
+fn subtract_be_bytes(a: &mut [u8; 32], b: &[u8; 32]) {
+    let mut borrow: u32 = 0;
+    for (ai, bi) in a.iter_mut().zip(b.iter()).rev() {
+        let result = (*ai as u32).wrapping_sub(*bi as u32).wrapping_sub(borrow);
+        *ai = result as u8;
+        borrow = (result >> 31) & 1;
+    }
 }
 
 fn validate_request_semantics(request: &ProveRequest) -> Result<(), ProveError> {
@@ -332,11 +380,32 @@ mod tests {
 
     #[test]
     fn encode_seal_prefixes_trusted_selector() {
-        let raw = [9u8; SEAL_PROOF_LEN];
+        let mut raw = [9u8; SEAL_PROOF_LEN];
+        raw[32..64].fill(1);
         let encoded = encode_seal(&raw);
         assert_eq!(encoded.len(), SEAL_BYTES_LEN);
         assert_eq!(&encoded[..SEAL_SELECTOR_LEN], &TRUSTED_SEAL_SELECTOR);
-        assert_eq!(&encoded[SEAL_SELECTOR_LEN..], &raw);
+        assert_eq!(&encoded[SEAL_SELECTOR_LEN..32 + SEAL_SELECTOR_LEN], &raw[..32]);
+
+        let mut expected_y = BN254_FIELD_MODULUS_Q;
+        let y = [1u8; 32];
+        subtract_be_bytes(&mut expected_y, &y);
+        assert_eq!(
+            &encoded[SEAL_SELECTOR_LEN + 32..SEAL_SELECTOR_LEN + 64],
+            &expected_y
+        );
+        assert_eq!(&encoded[SEAL_SELECTOR_LEN + 64..], &raw[64..]);
+    }
+
+    #[test]
+    fn encode_seal_preserves_zero_pi_a_y_coordinate() {
+        let raw = [0u8; SEAL_PROOF_LEN];
+        let encoded = encode_seal(&raw);
+
+        assert_eq!(
+            &encoded[SEAL_SELECTOR_LEN + 32..SEAL_SELECTOR_LEN + 64],
+            &[0u8; 32]
+        );
     }
 
     #[test]
