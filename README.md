@@ -87,6 +87,35 @@ This repository now contains the real proving path:
 - health, readiness, and metrics endpoints
 - Docker packaging
 
+It also owns the first private prover admin bootstrap slice under
+`admin-tools/`:
+
+- zk config administration
+- protocol program helpers for private admin flows
+- devnet preflight checks for private submission surfaces
+
+It does **not** yet own the shared verifier/localnet proof harness from the
+main AgenC repo. `verifier-localnet`, private-proof benchmarking, root
+verifier/bootstrap scripts, and protocol-owned IDL artifacts remain outside
+this first bootstrap until a released shared proof-harness contract exists.
+
+## Admin Tools
+
+Install and validate the private admin tools:
+
+```bash
+npm --prefix admin-tools install
+npm --prefix admin-tools run typecheck
+npm --prefix admin-tools run test
+```
+
+Run the commands directly:
+
+```bash
+npm --prefix admin-tools run zk:config -- show
+npm --prefix admin-tools run devnet:preflight
+```
+
 ## Operator Runbook
 
 This section is the operator-facing source of truth for how `agenc-prover` should be deployed and how it should be taken out of service safely.
@@ -188,7 +217,6 @@ Prometheus-style plaintext metrics with:
 - `/prove` request counters for auth failures, bad requests, rate limits, overload, and timeouts
 - proof lifecycle counters for started, completed, succeeded, invalid, and failed jobs
 - aggregate proof duration counters
-
 ## Local Run
 
 Protected mode is now the default:

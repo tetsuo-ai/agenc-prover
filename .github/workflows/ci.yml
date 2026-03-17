@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p agenc-prover-server
+      - run: cargo build --release -p agenc-prover-server --features production-prover
+
+  admin-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: admin-tools/package-lock.json
+      - run: node scripts/check-admin-bootstrap-boundary.mjs
+      - run: npm ci --prefix admin-tools
+      - run: npm --prefix admin-tools run typecheck
+      - run: npm --prefix admin-tools run test
