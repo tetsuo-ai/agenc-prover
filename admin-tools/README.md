@@ -30,3 +30,5 @@ Environment baseline:
 - Node.js 22+
 - npm 11.7.0
 - committed `admin-tools/package-lock.json` for deterministic installs
+
+Use [../docs/ADMIN_TOOLS.md](../docs/ADMIN_TOOLS.md) for the full command reference, image-id input formats, signer defaults, and the `devnet:preflight` caveat that it is a synthetic compatibility probe rather than the production prover contract.
