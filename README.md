@@ -2,12 +2,33 @@
 
 Separate prover service for AgenC private task completion.
 
+## Start Here
+
+- [docs/DOCS_INDEX.md](docs/DOCS_INDEX.md) - reading order for developers and AI agents
+- [docs/CODEBASE_MAP.md](docs/CODEBASE_MAP.md) - repo structure and ownership map
+- [docs/PROVING_ARCHITECTURE.md](docs/PROVING_ARCHITECTURE.md) - guest, methods, server, and `/prove` lifecycle
+- [docs/ADMIN_TOOLS.md](docs/ADMIN_TOOLS.md) - admin command reference
+- [docs/COMMANDS_AND_VALIDATION.md](docs/COMMANDS_AND_VALIDATION.md) - local validation, workflows, and script inventory
+
+## Repo Layout
+
+```text
+agenc-prover/
+  server/
+  guest/
+  methods/
+  admin-tools/
+  scripts/
+  docs/
+  .github/workflows/
+```
+
 ## Scope
 
 This repository is intentionally narrow:
 
 - expose a small `/prove` HTTP API for AgenC
-- keep prover-specific code isolated from the main AgenC repo
+- keep prover-specific code isolated from the umbrella repo and the product/runtime code in `agenc-core`
 - make security review and auditing easier
 
 The AgenC client already expects this contract:
@@ -94,10 +115,21 @@ It also owns the first private prover admin bootstrap slice under
 - protocol program helpers for private admin flows
 - devnet preflight checks for private submission surfaces
 
-It does **not** yet own the shared verifier/localnet proof harness from the
-main AgenC repo. `verifier-localnet`, private-proof benchmarking, root
-verifier/bootstrap scripts, and protocol-owned IDL artifacts remain outside
-this first bootstrap until a released shared proof-harness contract exists.
+It does **not** own the shared verifier/localnet proof harness in
+`agenc-core/tools/proof-harness`, root verifier/bootstrap scripts, or
+protocol-owned IDL artifacts. Local `/prove` benchmarking now lives in this
+repo via `scripts/benchmark-prove.sh`.
+
+## Developer Quickstart
+
+```bash
+cargo test -p agenc-prover-server
+cargo build --release -p agenc-prover-server --features production-prover
+node scripts/check-admin-bootstrap-boundary.mjs
+npm ci --prefix admin-tools
+npm --prefix admin-tools run typecheck
+npm --prefix admin-tools run test
+```
 
 ## Admin Tools
 
@@ -115,6 +147,8 @@ Run the commands directly:
 npm --prefix admin-tools run zk:config -- show
 npm --prefix admin-tools run devnet:preflight
 ```
+
+For the full admin-tools reference, use [docs/ADMIN_TOOLS.md](docs/ADMIN_TOOLS.md).
 
 ## Operator Runbook
 
