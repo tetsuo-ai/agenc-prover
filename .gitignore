@@ -5,5 +5,7 @@ target/
 .vscode/
 admin-tools/node_modules/
 .claude/
+CLAUDE.md
+claude.md
 AGENTS.md
 CONCORDIA_TODO.MD
